@@ -149,6 +149,25 @@ CREATE TABLE IF NOT EXISTS exit_count_corrections (
 CREATE INDEX IF NOT EXISTS idx_exit_count_corrections_serial
     ON exit_count_corrections(serial);
 
+-- 逐段实际通行核报：现场对已出发人群组逐段核报实际进入/离开分钟。
+-- serial 为全库唯一报送号（幂等键：同号同内容重试返回原记录，异内容
+-- 拒绝）；同组每段（group_id, seq）至多一条核报。滞留改编后已核报的
+-- 固定前缀仍保留（其 seq 不变），后续按新余程的序号续报；人工救援组
+-- 只核报其已有通道前缀。核报不改编排、占用与修订；场景重置清空本表。
+CREATE TABLE IF NOT EXISTS passage_reports (
+    serial          TEXT PRIMARY KEY,
+    group_id        INTEGER NOT NULL,
+    seq             INTEGER NOT NULL,
+    edge_id         INTEGER NOT NULL,
+    enter_minute    INTEGER NOT NULL,
+    exit_minute     INTEGER NOT NULL,
+    reported_minute INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_passage_reports_group_seq
+    ON passage_reports(group_id, seq);
+-- 报送号为 PRIMARY KEY 已全库唯一（幂等键）；(group_id, seq) 唯一索引为
+-- "同组每段至多一条核报"的数据库层兜底，常规判定由服务层在互斥锁内完成。
+
 -- 修订历史：每次成功的编排变更（场景重置/新增组/纠正组/登记封闭/
 -- 登记容量管制/现场节点滞留报告/推进时间）与编排变更在同一事务内写入；
 -- 快照为提交时刻的完整编排 JSON，落库后不再改动、查询时不按当前场景重算。
@@ -181,11 +200,12 @@ async def reset_db(db: aiosqlite.Connection) -> None:
     修订历史（revisions 表）不在清空之列：场景重置后旧修订仍可查询，
     修订号继续全局递增。
     """
-    # 人工救援队与其救援任务随场景重置清空；先导关系与出口清点记录（含更正
-    # 历史）亦清空；修订历史不在清空之列
+    # 人工救援队与其救援任务随场景重置清空；先导关系、出口清点记录（含更正
+    # 历史）与逐段实际通行核报亦清空；修订历史不在清空之列
     for table in ("rescue_tasks", "rescue_teams",
                   "delay_reports", "group_prerequisites",
                   "exit_count_corrections", "exit_counts",
+                  "passage_reports",
                   "route_steps", "groups", "closures",
                   "capacity_controls", "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
@@ -658,6 +678,59 @@ async def load_exit_count_corrections(db: aiosqlite.Connection,
     return [{"from_version": r[0], "to_version": r[1], "old_count": r[2],
              "new_count": r[3], "reason": r[4], "minute": r[5]}
             for r in rows]
+
+
+# --------------------------------------------------------------------------
+# 逐段实际通行核报（已出发人群组）
+# --------------------------------------------------------------------------
+
+async def insert_passage_report(db: aiosqlite.Connection, *, serial: str,
+                                group_id: int, seq: int, edge_id: int,
+                                enter_minute: int, exit_minute: int,
+                                reported_minute: int) -> None:
+    """登记一条逐段实际通行核报（调用方负责事务与全部受理校验）。"""
+    await db.execute(
+        """INSERT INTO passage_reports
+           (serial, group_id, seq, edge_id, enter_minute, exit_minute,
+            reported_minute)
+           VALUES(?,?,?,?,?,?,?)""",
+        (serial, group_id, seq, edge_id, enter_minute, exit_minute,
+         reported_minute))
+
+
+def _passage_report_row(row) -> dict:
+    return {"serial": row[0], "group_id": row[1], "seq": row[2],
+            "edge_id": row[3], "enter_minute": row[4],
+            "exit_minute": row[5], "reported_minute": row[6]}
+
+
+async def load_passage_report(db: aiosqlite.Connection,
+                              serial: str) -> dict | None:
+    """按报送号读取一条核报记录；不存在时返回 None。"""
+    async with db.execute(
+            """SELECT serial, group_id, seq, edge_id, enter_minute,
+                      exit_minute, reported_minute
+               FROM passage_reports WHERE serial=?""", (serial,)) as cur:
+        row = await cur.fetchone()
+    return None if row is None else _passage_report_row(row)
+
+
+async def load_passage_reports(db: aiosqlite.Connection,
+                               group_id: int | None = None) -> list[dict]:
+    """按组号、段序号升序列出核报记录；可限定单个组。"""
+    if group_id is None:
+        query = ("SELECT serial, group_id, seq, edge_id, enter_minute, "
+                 "exit_minute, reported_minute FROM passage_reports "
+                 "ORDER BY group_id, seq")
+        params: tuple = ()
+    else:
+        query = ("SELECT serial, group_id, seq, edge_id, enter_minute, "
+                 "exit_minute, reported_minute FROM passage_reports "
+                 "WHERE group_id=? ORDER BY seq")
+        params = (group_id,)
+    async with db.execute(query, params) as cur:
+        rows = await cur.fetchall()
+    return [_passage_report_row(r) for r in rows]
 
 
 # --------------------------------------------------------------------------

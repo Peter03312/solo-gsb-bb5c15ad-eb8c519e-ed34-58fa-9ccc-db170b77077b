@@ -248,6 +248,117 @@ class ExitCountGroupOut(GroupTallyOut):
     current_minute: int
 
 
+# --------------------------------------------------------------------------
+# 逐段实际通行核报（已出发人群组）
+# --------------------------------------------------------------------------
+
+class PassageReportIn(BaseModel):
+    """已出发组逐段实际通行核报：报送号+组号+现行路线段序号+通道号+实际时刻。"""
+    serial: str = Field(
+        ..., min_length=1,
+        description="非空唯一报送号（幂等键：同号同内容重试返回原记录，"
+                    "同号异内容拒绝）")
+    group_id: int = Field(..., ge=1, description="已出发人群组编号")
+    seq: int = Field(
+        ..., ge=0,
+        description="现行路线段序号（steps 中从 0 起的下标；滞留改编后已核报"
+                    "的固定前缀序号不变，余程按新余程序号续报）")
+    edge_id: int = Field(..., ge=1, description="该段现行路线上的通道编号")
+    enter_minute: int = Field(..., ge=0, description="实际进入分钟（非负）")
+    exit_minute: int = Field(..., ge=0, description="实际离开分钟（须晚于进入、"
+                                                    "不晚于当前分钟）")
+
+    @model_validator(mode="after")
+    def _enter_before_exit(self):
+        if self.exit_minute <= self.enter_minute:
+            raise ValueError("实际离开分钟必须晚于实际进入分钟")
+        return self
+
+
+class PassageReportOut(BaseModel):
+    """一条已受理的逐段实际通行核报记录。"""
+    serial: str
+    group_id: int
+    seq: int = Field(description="现行路线段序号（从 0 起）")
+    edge_id: int
+    enter_minute: int = Field(description="实际进入分钟")
+    exit_minute: int = Field(description="实际离开分钟")
+    reported_minute: int = Field(description="受理核报时的当前分钟")
+
+
+class PassageSegmentRowOut(BaseModel):
+    """单段并列视图：计划时刻与实绩时刻并列，并标出实绩异常。"""
+    seq: int
+    edge_id: int = Field(description="现行路线段通道编号")
+    from_node: int
+    to_node: int
+    planned_enter_minute: Optional[int] = Field(
+        None, description="计划进入分钟（未出发/未安排段为 null）")
+    planned_exit_minute: Optional[int] = Field(
+        None, description="计划离开分钟")
+    actual_enter_minute: Optional[int] = Field(
+        None, description="实际进入分钟（未核报为 null）")
+    actual_exit_minute: Optional[int] = Field(
+        None, description="实际离开分钟（未核报为 null）")
+    reported: bool = Field(description="该段是否已核报")
+    serial: Optional[str] = Field(None, description="该段核报报送号")
+    in_fixed_prefix: bool = Field(
+        description="是否为滞留改编时固定保留的已走前缀段")
+    # 实绩异常标记（仅已核报段非空）：actual 时刻与计划偏离仍如实保留
+    timing_deviation: Optional[bool] = Field(
+        None, description="实际进入/离开分钟是否与计划不一致")
+    closure_hit: Optional[bool] = Field(
+        None, description="实际通行区间是否命中该通道封闭时段")
+    over_capacity: Optional[bool] = Field(
+        None, description="实际通行期间是否曾超出当时有效容量（按已核报实绩汇总）")
+
+
+class GroupPassageReportsOut(BaseModel):
+    """单组逐段核报视图：并列计划/实绩、未核报段与逐段异常。"""
+    current_minute: int
+    group_id: int
+    status: str
+    size: int = Field(description="组人数（实绩人数汇总按整组计）")
+    reported_count: int = Field(description="已核报段数")
+    total_segments: int = Field(description="现行路线段总数")
+    segments: list[PassageSegmentRowOut] = Field(
+        default_factory=list, description="按现行路线顺序并列各段计划与实绩")
+    reports: list[PassageReportOut] = Field(
+        default_factory=list, description="已受理核报记录（按段序号升序）")
+
+
+class PassageReportListOut(BaseModel):
+    """全部组逐段核报视图。"""
+    current_minute: int
+    groups: list[GroupPassageReportsOut]
+
+
+class ActualMinuteLoadOut(BaseModel):
+    """通道某一分钟的已核报实绩人数与异常标记。"""
+    minute: int
+    used: int = Field(description="该分钟在该通道上的已核报实绩总人数")
+    effective_capacity: int = Field(
+        description="当时有效容量上限（管制时段内为 min(原容量, 管制上限)）")
+    closed: bool = Field(description="该分钟是否命中封闭时段")
+    over_capacity: bool = Field(description="实绩人数是否超出当时有效容量")
+    closure_hit: bool = Field(
+        description="是否有实绩通行区间命中该分钟的封闭（closed 的同义现场口径）")
+    groups: list[dict] = Field(
+        default_factory=list,
+        description="贡献该分钟实绩的组（group_id/size/enter_minute/exit_minute）")
+
+
+class ActualEdgeLoadOut(BaseModel):
+    """通道逐分钟已核报实绩占用、有效容量与异常。"""
+    edge_id: int
+    capacity: int
+    traversal_minutes: int
+    capacity_controls: list[CapacityControlOut] = Field(default_factory=list)
+    minutes: list[ActualMinuteLoadOut] = Field(
+        default_factory=list,
+        description="仅有实绩占用的分钟（升序）；逐分钟标出超容量或命中封闭")
+
+
 class GroupIn(BaseModel):
     id: int = Field(..., ge=1, description="人群组编号（正整数，唯一）")
     size: int = Field(..., gt=0, description="人数（正整数，整组不可拆分）")

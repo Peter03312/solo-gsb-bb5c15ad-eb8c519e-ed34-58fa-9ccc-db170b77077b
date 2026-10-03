@@ -42,6 +42,17 @@
   记录当前版本与非空原因把一条清点更正为非负人数（保留原值与更正历史，
   版本失配、对同一版本重复更正或更正后累计超额均整次拒绝）。清点与
   更正不改编排、不产生修订；场景重置清空全部清点记录。
+* 现场核报已出发人群组的逐段实际通行：每次提交非空唯一报送号、组号、
+  现行路线段序号（从 0 起）与通道号、实际进入/离开分钟；分钟非负、
+  进入早于离开且离开不晚于当前分钟；同组自第 0 段起沿现行路线连续
+  核报，后段实际进入不早于前段实际离开；人工救援组
+  （awaiting_rescue/rescuing/rescued）只核报其已有通道前缀，滞留改编后
+  已核报的固定前缀仍可查、余程按新余程续报。段不存在、通道不符或越序
+  时报 409 且不留记录；同号同内容重试返回原记录，同号异内容或同段重复
+  整次拒绝。查询并列各段计划与实绩时刻、未核报段，并按已核报实绩汇总
+  通道逐分钟人数、标出超出当时有效容量或命中封闭的异常；实际偏离或
+  超额均留痕，不反向修改编排、占用或修订。核报不改编排、不产生修订；
+  场景重置清空本场实绩。
 
 修订历史
 ========
@@ -64,15 +75,17 @@ from pydantic import BaseModel, Field, ValidationError
 
 from . import db
 from .planner import effective_capacity, plan_group
-from .schemas import (CapacityControlIn, CapacityControlListOut,
-                      CapacityControlOut, ClosureIn, ConflictOut,
-                      DelayReportAliasIn, DelayReportIn,
+from .schemas import (ActualEdgeLoadOut, CapacityControlIn,
+                      CapacityControlListOut, CapacityControlOut, ClosureIn,
+                      ConflictOut, DelayReportAliasIn, DelayReportIn,
                       ExitCountArrivalOut, ExitCountCorrectionIn,
                       ExitCountCorrectionOut, ExitCountGroupOut,
                       ExitCountIn, ExitCountListOut, ExitCountRecordOut,
                       GroupChangeOut, GroupCorrectionIn, GroupIn,
-                      GroupPlanOut, GroupTallyOut,
-                      PlanResponse, PrerequisiteBasisOut, PrerequisiteIn,
+                      GroupPassageReportsOut, GroupPlanOut, GroupTallyOut,
+                      PassageReportIn, PassageReportListOut, PassageReportOut,
+                      PassageSegmentRowOut, PlanResponse,
+                      PrerequisiteBasisOut, PrerequisiteIn,
                       PrerequisiteListOut, PrerequisiteOut,
                       RescueCompletionIn, RescueDispatchIn,
                       RescueTaskListOut, RescueTaskOut, RescueTeamIn,
@@ -110,12 +123,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.5.0",
+    version="1.6.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
                 "支持封闭时段、容量管制时段、每分钟容量约束、增量重排、"
                 "先导组放行间隔（多级依赖按依赖顺序安排）、"
-                "现场节点滞留报告与人工救援队交接核销，"
-                "以及出口按组清点实际撤离人数（幂等登记、版本化更正）。",
+                "现场节点滞留报告与人工救援队交接核销、"
+                "出口按组清点实际撤离人数（幂等登记、版本化更正），"
+                "以及已出发人群组逐段实际通行核报（幂等报送、计划/实绩"
+                "并列、通道逐分钟实绩人数与超容量/封闭异常标注）。",
     lifespan=lifespan,
 )
 
@@ -1320,10 +1335,6 @@ async def list_prerequisites(request: Request):
                                relations=relations)
 
 
-# --------------------------------------------------------------------------
-# 现场节点滞留报告
-# --------------------------------------------------------------------------
-
 @app.post("/groups/{group_id}/delay-report", tags=["现场报告"],
           response_model=PlanResponse,
           responses={409: {"description": "组未出发或节点/时机不符，整次拒绝"},
@@ -2030,6 +2041,408 @@ async def get_group_exit_counts(group_id: int, request: Request):
         tally = await _build_group_tally(conn, row, minute_now)
     return ExitCountGroupOut(current_minute=minute_now,
                              **tally.model_dump())
+
+
+# --------------------------------------------------------------------------
+# 逐段实际通行核报（已出发人群组）
+# --------------------------------------------------------------------------
+
+# 可逐段核报实际通行的组状态：均为已出发（含待救援/救援中/已人工送达）。
+# 人工救援组只核报其已有通道前缀（route_steps 中滞留改编保留的已走前缀）。
+_PASSAGE_REPORTABLE_STATUSES = (
+    "fixed", "awaiting_rescue", "rescuing", "rescued")
+
+
+def _passage_report_conflict(reason: str, message: str,
+                             payload: PassageReportIn, minute_now: int,
+                             *, status: str | None = None,
+                             extra: dict | None = None) -> JSONResponse:
+    """构造统一的逐段通行核报拒绝响应（HTTP 409 + error/message/conflicts）。"""
+    conflict = {"serial": payload.serial, "group_id": payload.group_id,
+                "seq": payload.seq, "edge_id": payload.edge_id,
+                "enter_minute": payload.enter_minute,
+                "exit_minute": payload.exit_minute,
+                "current_minute": minute_now, "reason": reason}
+    if status is not None:
+        conflict["status"] = status
+    if extra:
+        conflict.update(extra)
+    return JSONResponse(
+        status_code=409,
+        content={"error": "PASSAGE_REPORT_NOT_ACCEPTABLE",
+                 "message": message, "conflicts": [conflict]})
+
+
+async def _load_group_steps(conn: aiosqlite.Connection,
+                            group_id: int) -> list[dict]:
+    """读取一组现行路线的全部段（按 seq 升序）。"""
+    async with conn.execute(
+            """SELECT seq, edge_id, from_node, to_node, enter_minute,
+                      exit_minute
+               FROM route_steps WHERE group_id=? ORDER BY seq""",
+            (group_id,)) as cur:
+        return [dict(zip(("seq", "edge_id", "from_node", "to_node",
+                          "enter_minute", "exit_minute"), row))
+                for row in await cur.fetchall()]
+
+
+async def _load_edge_closures(conn: aiosqlite.Connection
+                              ) -> dict[int, list[tuple[int, int]]]:
+    """加载全部封闭时段（edge_id -> 按开始分钟升序的 [(a, b), ...]）。"""
+    async with conn.execute(
+            "SELECT edge_id, start_minute, end_minute FROM closures") as cur:
+        closures: dict[int, list[tuple[int, int]]] = {}
+        for edge_id, a, b in await cur.fetchall():
+            closures.setdefault(edge_id, []).append((a, b))
+    for segs in closures.values():
+        segs.sort()
+    return closures
+
+
+async def _load_edge_controls(conn: aiosqlite.Connection
+                              ) -> dict[int, list[tuple[int, int, int]]]:
+    """加载全部容量管制时段（edge_id -> [(a, b, cap), ...]）。"""
+    async with conn.execute(
+            """SELECT edge_id, start_minute, end_minute, capacity
+               FROM capacity_controls""") as cur:
+        controls: dict[int, list[tuple[int, int, int]]] = {}
+        for edge_id, a, b, cap in await cur.fetchall():
+            controls.setdefault(edge_id, []).append((a, b, cap))
+    return controls
+
+
+def _interval_hits_closure(enter_m: int, exit_m: int,
+                           closures: list[tuple[int, int]]) -> bool:
+    """通行区间 [enter_m, exit_m) 是否与任一封闭 [a,b) 相交。"""
+    return any(enter_m < b and a < exit_m for a, b in closures)
+
+
+async def _load_actual_loads(conn: aiosqlite.Connection
+                             ) -> dict[tuple[int, int], dict]:
+    """按已核报实绩汇总 (edge_id, minute) -> 实绩人数与相关组明细。
+
+    一条核报段实际占用 [actual_enter, actual_exit) 的每一分钟；人数取整组
+    人数（整组不可拆分）。汇总同时用于逐段异常标注与通道逐分钟实绩查询，
+    保证两处口径一致；实绩不回写编排占用。
+    """
+    async with conn.execute(
+            """SELECT pr.edge_id, pr.enter_minute, pr.exit_minute,
+                      pr.group_id, g.size
+               FROM passage_reports pr JOIN groups g ON g.id=pr.group_id""") \
+            as cur:
+        rows = await cur.fetchall()
+    loads: dict[tuple[int, int], dict] = {}
+    for edge_id, enter_m, exit_m, gid, size in rows:
+        for minute in range(enter_m, exit_m):
+            slot = loads.setdefault(
+                (edge_id, minute), {"used": 0, "groups": []})
+            slot["used"] += size
+            slot["groups"].append(
+                {"group_id": gid, "size": size,
+                 "enter_minute": enter_m, "exit_minute": exit_m})
+    return loads
+
+
+async def _build_group_passage_view(conn: aiosqlite.Connection,
+                                    group_row: tuple,
+                                    minute_now: int,
+                                    closures_by_edge, controls_by_edge,
+                                    edge_capacity: dict[int, int],
+                                    actual_loads) -> GroupPassageReportsOut:
+    """组装单组逐段并列视图（计划/实绩、未核报段、逐段异常）。"""
+    gid, size, status = group_row[0], group_row[1], group_row[2]
+    steps = await _load_group_steps(conn, gid)
+    reports = await db.load_passage_reports(conn, gid)
+    # 滞留改编固定前缀步数（人工救援/待救援组只可核报此前缀）
+    report = await db.load_delay_report(conn, gid)
+    prefix_count = report["prefix_step_count"] if report else None
+
+    report_by_seq = {r["seq"]: r for r in reports}
+    segments: list[PassageSegmentRowOut] = []
+    for step in steps:
+        seq = step["seq"]
+        rec = report_by_seq.get(seq)
+        closures = closures_by_edge.get(step["edge_id"], [])
+        controls = controls_by_edge.get(step["edge_id"], [])
+        base_cap = edge_capacity.get(step["edge_id"])
+        timing_dev = closure_hit = over_cap = None
+        if rec is not None:
+            timing_dev = (rec["enter_minute"] != step["enter_minute"]
+                          or rec["exit_minute"] != step["exit_minute"])
+            closure_hit = _interval_hits_closure(
+                rec["enter_minute"], rec["exit_minute"], closures)
+            if base_cap is not None:
+                over_cap = any(
+                    actual_loads.get(
+                        (step["edge_id"], minute), {}).get("used", 0)
+                    > effective_capacity(base_cap, controls, minute)
+                    for minute in range(rec["enter_minute"],
+                                        rec["exit_minute"]))
+        segments.append(PassageSegmentRowOut(
+            seq=seq, edge_id=step["edge_id"], from_node=step["from_node"],
+            to_node=step["to_node"],
+            planned_enter_minute=step["enter_minute"],
+            planned_exit_minute=step["exit_minute"],
+            actual_enter_minute=(rec or {}).get("enter_minute"),
+            actual_exit_minute=(rec or {}).get("exit_minute"),
+            reported=rec is not None, serial=(rec or {}).get("serial"),
+            in_fixed_prefix=(prefix_count is not None
+                             and seq < prefix_count),
+            timing_deviation=timing_dev, closure_hit=closure_hit,
+            over_capacity=over_cap))
+
+    return GroupPassageReportsOut(
+        current_minute=minute_now, group_id=gid, status=status, size=size,
+        reported_count=sum(1 for s in segments if s.reported),
+        total_segments=len(segments), segments=segments,
+        reports=[PassageReportOut(**r) for r in reports])
+
+
+async def _apply_passage_report(conn: aiosqlite.Connection,
+                                payload: PassageReportIn):
+    """受理一条逐段实际通行核报（调用方已持锁）。
+
+    报送号幂等：同号同内容返回原记录（200），同号异内容整次拒绝（409）。
+    新报送须：组已出发、段序号为现行路线的下一段（沿路线顺序、不可越序或
+    重复）、通道与该段现行通道一致、本段进入不早于上一已核报段离开、离开
+    不晚于当前分钟。人工救援组（awaiting_rescue/rescuing/rescued）只可
+    核报其已有通道前缀。任何拒绝均不留记录；核报不改编排、占用与修订。
+    """
+    minute_now = await db.get_current_minute(conn)
+
+    # 1) 报送号幂等：同号同内容返回原记录，异内容整次拒绝
+    existing = await db.load_passage_report(conn, payload.serial)
+    if existing is not None:
+        same = (existing["group_id"] == payload.group_id
+                and existing["seq"] == payload.seq
+                and existing["edge_id"] == payload.edge_id
+                and existing["enter_minute"] == payload.enter_minute
+                and existing["exit_minute"] == payload.exit_minute)
+        if same:
+            return JSONResponse(
+                status_code=200,
+                content=PassageReportOut(**existing).model_dump())
+        return JSONResponse(
+            status_code=409,
+            content={"error": "PASSAGE_REPORT_SERIAL_CONFLICT",
+                     "message": "报送号已登记且提交内容不一致，整次拒绝",
+                     "conflicts": [{
+                         "serial": payload.serial,
+                         "reason": "SERIAL_CONTENT_MISMATCH",
+                         "current_minute": minute_now,
+                         "existing": {
+                             "group_id": existing["group_id"],
+                             "seq": existing["seq"],
+                             "edge_id": existing["edge_id"],
+                             "enter_minute": existing["enter_minute"],
+                             "exit_minute": existing["exit_minute"]}}]})
+
+    # 2) 组须存在且已出发
+    async with conn.execute(
+            "SELECT size, status FROM groups WHERE id=?",
+            (payload.group_id,)) as cur:
+        group_row = await cur.fetchone()
+    if group_row is None:
+        raise HTTPException(422, f"人群组 {payload.group_id} 不存在")
+    size, status = group_row
+
+    def _reject(reason, message, **extra):
+        return _passage_report_conflict(
+            reason, message, payload, minute_now, status=status, extra=extra)
+
+    if status not in _PASSAGE_REPORTABLE_STATUSES:
+        return _reject(
+            "GROUP_NOT_DEPARTED",
+            "该组尚未出发，逐段实际通行核报不受理，整次拒绝")
+
+    # 3) 段序号须在现行路线内（人工救援组只可核报其已有通道前缀）
+    steps = await _load_group_steps(conn, payload.group_id)
+    limit = len(steps)
+    if status in ("awaiting_rescue", "rescuing", "rescued"):
+        delay = await db.load_delay_report(conn, payload.group_id)
+        limit = delay["prefix_step_count"] if delay is not None else 0
+    if payload.seq >= limit:
+        return _reject(
+            "SEGMENT_NOT_FOUND",
+            "现行路线段序号不存在（人工救援组只可核报已有通道前缀），"
+            "整次拒绝且不留记录",
+            total_segments=len(steps), reportable_segments=limit)
+
+    step = steps[payload.seq]
+
+    # 4) 通道须与该段现行通道一致
+    if payload.edge_id != step["edge_id"]:
+        return _reject(
+            "EDGE_MISMATCH",
+            "核报通道与该段现行路线通道不符，整次拒绝且不留记录",
+            expected_edge_id=step["edge_id"])
+
+    # 5) 沿路线顺序：下一段序号恰为已核报段数；不可重复、不可越序
+    reports = await db.load_passage_reports(conn, payload.group_id)
+    if any(r["seq"] == payload.seq for r in reports):
+        return _reject(
+            "SEGMENT_ALREADY_REPORTED",
+            "该段已核报，同段重复报送整次拒绝且不留记录")
+    expected_seq = len(reports)
+    if payload.seq != expected_seq:
+        return _reject(
+            "OUT_OF_ORDER",
+            "同组须沿路线顺序核报：下一应报段序号与提交不符（越序或漏段），"
+            "整次拒绝且不留记录",
+            expected_seq=expected_seq, reported_count=len(reports))
+
+    # 6) 时序：后段实际进入不早于前段实际离开；离开不晚于当前分钟
+    if reports:
+        prev_exit = max(r["exit_minute"] for r in reports
+                        if r["seq"] < payload.seq)
+        if payload.enter_minute < prev_exit:
+            return _reject(
+                "ENTER_BEFORE_PREVIOUS_EXIT",
+                "本段实际进入分钟早于上一已核报段的实际离开分钟，整次拒绝"
+                "且不留记录",
+                previous_exit_minute=prev_exit)
+    if payload.exit_minute > minute_now:
+        return _reject(
+            "EXIT_MINUTE_IN_FUTURE",
+            "实际离开分钟晚于当前分钟，整次拒绝且不留记录")
+
+    async with db.transaction(conn):
+        await db.insert_passage_report(
+            conn, serial=payload.serial, group_id=payload.group_id,
+            seq=payload.seq, edge_id=payload.edge_id,
+            enter_minute=payload.enter_minute,
+            exit_minute=payload.exit_minute, reported_minute=minute_now)
+    return JSONResponse(
+        status_code=201,
+        content=PassageReportOut(
+            serial=payload.serial, group_id=payload.group_id,
+            seq=payload.seq, edge_id=payload.edge_id,
+            enter_minute=payload.enter_minute,
+            exit_minute=payload.exit_minute,
+            reported_minute=minute_now).model_dump())
+
+
+@app.post("/passage-reports", tags=["逐段通行核报"],
+          response_model=PassageReportOut,
+          responses={
+              200: {"description": "同报送号同内容的幂等重试，返回原记录"},
+              409: {"description": "段不存在/通道不符/越序/同段重复/"
+                                   "时序冲突，整次拒绝且不留记录"},
+              422: {"description": "组不存在，或进入/离开分钟取值非法"}})
+async def submit_passage_report(payload: PassageReportIn, request: Request):
+    """现场核报已出发人群组的逐段实际通行。
+
+    每次提交唯一报送号、组号、现行路线段序号（从 0 起）与通道号、实际
+    进入和离开分钟。分钟须非负、进入早于离开且离开不晚于当前分钟；同组
+    须沿现行路线顺序逐段核报，后段实际进入不得早于前段实际离开。
+    路线段不存在（人工救援/待救援组仅可核报已有通道前缀）、通道与现行
+    路线不符或越序报送时整次拒绝（409）且不留记录；同报送号同内容重试
+    返回原记录（HTTP 200），同报送号异内容或同段重复报送整次拒绝（409）。
+    核报为实绩留痕：实际时刻偏离计划、实绩人数超出当时有效容量或命中
+    封闭均仍受理并在查询中标出异常，**不**反向修改编排、占用或修订。
+    场景重置清空本场全部实绩核报。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        return await _apply_passage_report(conn, payload)
+
+
+@app.get("/passage-reports/groups", tags=["逐段通行核报"],
+         response_model=PassageReportListOut)
+async def list_all_passage_reports(request: Request):
+    """并列全部组各段计划与实绩时刻、未核报段，并按已核报实绩逐段标出
+    超容量/命中封闭异常（受理与时间推进、滞留改编保持一致视图）。"""
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        async with conn.execute(
+                "SELECT id, size, status FROM groups ORDER BY id") as cur:
+            group_rows = await cur.fetchall()
+        closures_by_edge = await _load_edge_closures(conn)
+        controls_by_edge = await _load_edge_controls(conn)
+        async with conn.execute("SELECT id, capacity FROM edges") as cur:
+            edge_capacity = {eid: cap for eid, cap in await cur.fetchall()}
+        actual_loads = await _load_actual_loads(conn)
+        groups = [
+            await _build_group_passage_view(
+                conn, row, minute_now, closures_by_edge, controls_by_edge,
+                edge_capacity, actual_loads)
+            for row in group_rows]
+    return PassageReportListOut(current_minute=minute_now, groups=groups)
+
+
+@app.get("/passage-reports/groups/{group_id}", tags=["逐段通行核报"],
+         response_model=GroupPassageReportsOut,
+         responses={404: {"description": "人群组不存在"}})
+async def get_group_passage_reports(group_id: int, request: Request):
+    """单组逐段核报视图：并列各段计划与实际进入/离开分钟、未核报段与
+    已受理核报记录；滞留改编后已核报的固定前缀仍可查，余程按新余程核报。"""
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        async with conn.execute(
+                "SELECT id, size, status FROM groups WHERE id=?",
+                (group_id,)) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(404, f"人群组 {group_id} 不存在")
+        closures_by_edge = await _load_edge_closures(conn)
+        controls_by_edge = await _load_edge_controls(conn)
+        async with conn.execute("SELECT id, capacity FROM edges") as cur:
+            edge_capacity = {eid: cap for eid, cap in await cur.fetchall()}
+        actual_loads = await _load_actual_loads(conn)
+        view = await _build_group_passage_view(
+            conn, row, minute_now, closures_by_edge, controls_by_edge,
+            edge_capacity, actual_loads)
+    return view
+
+
+@app.get("/passages/{edge_id}/actual-load", tags=["逐段通行核报"],
+         response_model=ActualEdgeLoadOut,
+         responses={404: {"description": "通道不存在"}})
+async def get_edge_actual_load(edge_id: int, request: Request,
+                               minute: int | None = None):
+    """按已核报实绩汇总通道逐分钟人数，并标出超出当时有效容量或命中封闭
+    的异常分钟（可加 ``?minute=n`` 只看某一分钟；仅有实绩占用的分钟列出）。
+
+    实绩人数按整组人数累加，区间为该段核报的 ``[实际进入, 实际离开)``；
+    每分钟的有效容量取登记的容量管制（``min(原容量, 管制上限)``，时段外
+    为原容量），封闭标记取自当前封闭时段。实绩超出或命中封闭只标注、不
+    反向修改编排与占用。
+    """
+    conn = request.app.state.db
+    async with conn.execute(
+            "SELECT capacity, minutes FROM edges WHERE id=?",
+            (edge_id,)) as cur:
+        cap_row = await cur.fetchone()
+    if cap_row is None:
+        raise HTTPException(404, f"通道 {edge_id} 不存在")
+    base_cap, traversal = cap_row
+    async with request.app.state.lock:
+        closures = await _load_edge_closures(conn)
+        edge_closures = closures.get(edge_id, [])
+        controls = (await _load_edge_controls(conn)).get(edge_id, [])
+        actual_loads = await _load_actual_loads(conn)
+
+    minutes = []
+    for m in sorted(m for (eid, m) in actual_loads if eid == edge_id):
+        if minute is not None and m != minute:
+            continue
+        slot = actual_loads[(edge_id, m)]
+        eff_cap = effective_capacity(base_cap, controls, m)
+        closed = any(a <= m < b for a, b in edge_closures)
+        minutes.append({
+            "minute": m, "used": slot["used"],
+            "effective_capacity": eff_cap, "closed": closed,
+            "closure_hit": closed,
+            "over_capacity": slot["used"] > eff_cap,
+            "groups": slot["groups"]})
+    return ActualEdgeLoadOut(
+        edge_id=edge_id, capacity=base_cap, traversal_minutes=traversal,
+        capacity_controls=[
+            {"edge_id": edge_id, "start_minute": a, "end_minute": b,
+             "capacity": cap} for a, b, cap in controls],
+        minutes=minutes)
 
 
 @app.post("/tick", tags=["时间"], response_model=PlanResponse)

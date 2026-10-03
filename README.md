@@ -25,6 +25,11 @@
 或已由人工救援实际送达该出口的组可登记，同组累计不超组人数；可凭原
 流水号、记录版本与非空原因**更正**为非负人数（保留原值与更正历史），
 并按组查询应到/已清点/未清点人数与逐条记录。
+支持现场核报已出发人群组的**逐段实际通行**：每次提交唯一报送号、组号、
+现行路线段序号与通道号、实际进入和离开分钟，沿路线顺序逐段核报（人工
+救援组只核报已有通道前缀）；查询并列各段计划与实绩时刻、未核报段，并
+按已核报实绩汇总通道逐分钟人数、标出超出当时有效容量或命中封闭的异常；
+偏离或超额仍留痕，不反向修改编排、占用或修订。
 每次成功的编排变更都会落库一条**全局递增修订**（前后完整快照 + 逐组差异），
 供指挥员追溯"每次疏散变更为何改动编排"。
 
@@ -74,7 +79,7 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查，返回当前分钟 |
-| POST | `/scenario` | 全量重置场景（通道/出口/封闭/人群组），立即编排；同时清除全部容量管制、人工救援队与救援任务、先导关系与出口清点记录（旧修订保留） |
+| POST | `/scenario` | 全量重置场景（通道/出口/封闭/人群组），立即编排；同时清除全部容量管制、人工救援队与救援任务、先导关系、出口清点记录与逐段通行核报实绩（旧修订保留） |
 | GET | `/plan` | 查询每组路线、出发/到达分钟或无法安排的原因 |
 | POST | `/groups` | 新增一组或多组，**仅重排未出发组** |
 | POST | `/group-corrections` | 批量纠正未出发组的属性（非空清单，整批原子生效）；目标组已出发则 **409 整批拒绝** |
@@ -94,6 +99,10 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/exit-counts/{serial}/correction` | 凭原流水号+记录版本+非空原因更正为非负人数（保留原值与历史）；版本失配/重复更正/超额 **409**，未知流水号 **404** |
 | GET | `/exit-counts` | 按组列出应到/已清点/未清点人数及逐条记录（含更正历史） |
 | GET | `/exit-counts/{group_id}` | 单组清点台账；未知组号 **404** |
+| POST | `/passage-reports` | 核报已出发组一段实际通行（非空唯一报送号幂等）；段不存在/通道不符/越序/同段重复/时序冲突 **409** 且不留记录，组不存在或分钟非法 **422** |
+| GET | `/passage-reports/groups` | 并列全部组各段计划与实绩时刻、未核报段与逐段超容量/封闭异常 |
+| GET | `/passage-reports/groups/{group_id}` | 单组逐段核报视图；未知组号 **404** |
+| GET | `/passages/{edge_id}/actual-load` | 通道逐分钟**已核报实绩**人数、当时有效容量与封闭/超容量异常，可加 `?minute=n`；未知通道 **404** |
 | POST | `/tick` | 推进当前分钟（body 可传 `{"minutes": n}`，默认 1） |
 | GET | `/passages/{edge_id}/load` | 通道逐分钟占用与各分钟有效上限，可加 `?minute=n` |
 | GET | `/revisions` | 列出全部修订（修订号/触发操作/当时分钟），重置与重启后保留 |
@@ -342,6 +351,94 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
     分钟）；尚未抵达的组三个字段均为 `null`。
 * **场景重置**（`POST /scenario`）清空全部清点记录与更正历史；旧修订
   保留，流水号可在新场景重新使用。
+
+**逐段实际通行核报（已出发人群组）**
+
+* `POST /passage-reports` 核报已出发组的一段实际通行：
+
+  ```json
+  {"serial": "P-0001", "group_id": 1, "seq": 0, "edge_id": 1,
+   "enter_minute": 0, "exit_minute": 4}
+  ```
+
+  * `serial`：**非空**唯一报送号（幂等键）；`seq` 为现行路线段序号
+    （`/plan` 中 `steps` 的下标，**从 0 起**）；`edge_id` 为该段现行
+    路线上的通道；`enter_minute`/`exit_minute` 为实际进入/离开分钟。
+  * **基本约束**：仅已出发组（`fixed` / `awaiting_rescue` / `rescuing`
+    / `rescued`）可核报；分钟非负、实际进入早于实际离开、实际离开不晚于
+    当前分钟。
+  * **沿路线顺序**：同组必须从 `seq=0` 起逐段连续核报，下一应报段序号
+    恰为已核报段数；不可越序、漏段，后段实际进入不得早于前段实际离开。
+  * **滞留改编**：节点滞留改编后，已核报的**固定前缀**原样保留、仍可
+    查询（视图中 `in_fixed_prefix=true`），余程按新余程的段序号继续
+    核报（前缀段数即前缀段序号数，新余程从该序号续编）。
+  * **人工救援组**：`awaiting_rescue` / `rescuing` / `rescued` 的组只
+    可核报其**已有通道前缀**；对余程序号的核报按"路线段不存在"拒绝。
+  * 下列情形整次拒绝（409 `PASSAGE_REPORT_NOT_ACCEPTABLE`，
+    **不留记录**），`conflicts[0].reason` 区分：
+
+    | reason | 触发条件 |
+    | --- | --- |
+    | `GROUP_NOT_DEPARTED` | 组尚未出发（`scheduled`/`failed`/`pending`/`blocked`） |
+    | `SEGMENT_NOT_FOUND` | 段序号不在现行路线内（人工救援组越出已有前缀） |
+    | `EDGE_MISMATCH` | 核报通道与该段现行通道不符（附 `expected_edge_id`） |
+    | `OUT_OF_ORDER` | 段序号不是下一应报序号（越序/漏段，附 `expected_seq`） |
+    | `SEGMENT_ALREADY_REPORTED` | 同段重复报送（已用另一报送号核报过该段） |
+    | `ENTER_BEFORE_PREVIOUS_EXIT` | 本段实际进入早于上一段实际离开（附 `previous_exit_minute`） |
+    | `EXIT_MINUTE_IN_FUTURE` | 实际离开分钟晚于当前分钟 |
+
+  * **幂等**：同一报送号**同内容**（组号/段序号/通道/进入/离开分钟均
+    一致）重试返回 HTTP 200 与原记录；**异内容**返回 409
+    `PASSAGE_REPORT_SERIAL_CONFLICT`（`reason=SERIAL_CONTENT_MISMATCH`，
+    附已登记内容）。组不存在或分钟取值为负、进入不早于离开、报送号为空
+    返回 422。首次受理返回 HTTP 201。
+  * **只留痕、不反控**：实际时刻偏离计划、实绩人数超出当时有效容量或
+    实绩通行命中封闭时段都**照常受理**，在查询中标出异常，但**不**反向
+    修改编排、通道占用或修订。核报本身不产生修订。
+* `GET /passage-reports/groups/{group_id}` 与
+  `GET /passage-reports/groups` 查询单组/全部组的逐段并列视图：
+
+  ```json
+  {
+    "current_minute": 7,
+    "group_id": 1, "status": "fixed", "size": 10,
+    "reported_count": 2, "total_segments": 2,
+    "segments": [
+      {"seq": 0, "edge_id": 1, "from_node": 1, "to_node": 2,
+       "planned_enter_minute": 0, "planned_exit_minute": 4,
+       "actual_enter_minute": 0, "actual_exit_minute": 4,
+       "reported": true, "serial": "P-0001",
+       "in_fixed_prefix": false,
+       "timing_deviation": false, "closure_hit": false,
+       "over_capacity": false},
+      {"seq": 1, "edge_id": 2, "from_node": 2, "to_node": 6,
+       "planned_enter_minute": 4, "planned_exit_minute": 6,
+       "actual_enter_minute": 5, "actual_exit_minute": 7,
+       "reported": true, "serial": "P-0002",
+       "in_fixed_prefix": false,
+       "timing_deviation": true, "closure_hit": false,
+       "over_capacity": false}
+    ],
+    "reports": ["…已受理核报记录（按段序号升序）…"]
+  }
+  ```
+
+  * 每段并列计划进入/离开与实际进入/离开；未核报段 `reported=false`、
+    实际时刻为 `null`，仍随现行路线列出。
+  * 异常标记（仅已核报段非空）：`timing_deviation`（实际进入/离开与
+    计划是否不一致）、`closure_hit`（实际通行区间
+    `[实际进入, 实际离开)` 是否命中该通道当前封闭时段）、
+    `over_capacity`（实际通行期间是否曾超出该分钟当时有效容量，按全部
+    已核报实绩汇总）。
+* `GET /passages/{edge_id}/actual-load?minute=n` 按通道汇总**已核报
+  实绩**的逐分钟人数（区间取各核报段的 `[实际进入, 实际离开)`，人数
+  按整组人数累加），逐分钟给出 `used`、`effective_capacity`（管制时段
+  内为 `min(原容量, 管制上限)`）、`closed`/`closure_hit`（是否命中
+  封闭）与 `over_capacity`（实绩是否超容量）；仅有实绩占用的分钟列出，
+  未知通道 404。规划占用仍以 `GET /passages/{edge_id}/load` 为准，
+  两者互不影响。
+* **场景重置**（`POST /scenario`）清空本场全部实绩核报；旧修订保留，
+  报送号可在新场景重新使用。
 
 ### 响应（GET /plan 与所有变更接口）
 
@@ -687,6 +784,18 @@ curl -s -X POST http://localhost:8000/exit-counts/C-0001/correction \
 
 # 按组查询清点台账：应到/已清点/未清点与逐条记录
 curl -s http://localhost:8000/exit-counts/1 | python3 -m json.tool
+
+# 组1 已出发后，核报其第 0 段（通道1）实际第 0 分钟进入、第 4 分钟离开
+curl -s -X POST http://localhost:8000/passage-reports \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "P-0001", "group_id": 1, "seq": 0, "edge_id": 1,
+       "enter_minute": 0, "exit_minute": 4}' | python3 -m json.tool
+
+# 查询单组各段计划与实绩时刻并列、未核报段与逐段异常
+curl -s http://localhost:8000/passage-reports/groups/1 | python3 -m json.tool
+
+# 通道1 按已核报实绩汇总逐分钟人数（标出超容量/命中封闭）
+curl -s http://localhost:8000/passages/1/actual-load | python3 -m json.tool
 ```
 
 ## 5. 编排语义（约定）
@@ -784,18 +893,34 @@ curl -s http://localhost:8000/exit-counts/1 | python3 -m json.tool
     每次更正追加一条历史并使版本 +1）；版本失配、对同一版本重复更正
     或更正后累计超额均整次拒绝（409），记录与历史不变。清点与更正
     不改编排、不产生修订；场景重置清空全部清点记录与更正历史。
+17. **逐段实际通行核报**：现场对已出发人群组（`fixed` /
+    `awaiting_rescue` / `rescuing` / `rescued`）沿现行路线逐段核报实际
+    通行。每次提交非空唯一报送号、组号、现行路线段序号（从 0 起）、
+    通道号与实际进入/离开分钟；分钟非负、进入早于离开且离开不晚于当前
+    分钟；同组自第 0 段起连续核报，不可越序/漏段/同段重复，后段实际
+    进入不早于前段实际离开；核报通道须为该段现行通道。路线段不存在
+    （人工救援组只可核报已有通道前缀）、通道不符或越序时整次拒绝
+    （409）且不留记录；同报送号同内容重试返回原记录（HTTP 200），
+    同号异内容或同段重复报送整次拒绝（409）。节点滞留改编后已核报的
+    固定前缀仍可查，余程按新余程段序号续报。查询并列各段计划与实绩
+    时刻、未核报段，并按已核报实绩（整组人数 × 实际占用分钟区间）
+    汇总通道逐分钟人数，标出超出当时有效容量（容量管制取
+    `min(原容量, 管制上限)`）或命中封闭的异常；实际时刻偏离、实绩超额
+    或命中封闭均照常留痕并标注，**不**反向修改编排、占用或修订。核报
+    不改编排、不产生修订；受理与时间推进、改编在同一互斥视图下一致；
+    场景重置清空本场全部实绩核报。
 
 ## 6. 项目结构
 
 ```
 app/
-  main.py       FastAPI 路由、事务/互斥、增量重排（含先导依赖多轮安排）与拒绝逻辑、先导关系登记/查询、现场滞留报告、人工救援队派遣/结案、出口清点登记/更正/查询、修订记录与差异
+  main.py       FastAPI 路由、事务/互斥、增量重排（含先导依赖多轮安排）与拒绝逻辑、先导关系登记/查询、现场滞留报告、人工救援队派遣/结案、出口清点登记/更正/查询、逐段实际通行核报与实绩异常汇总、修订记录与差异
   planner.py    编排核心：时变 FIFO 多标签最短路 + 容量/封闭可行性
-  db.py         SQLite 建表、世界状态加载、整组事务化持久化、先导关系/滞留报告/出口清点与修订落库
+  db.py         SQLite 建表、世界状态加载、整组事务化持久化、先导关系/滞留报告/出口清点/逐段通行核报与修订落库
   schemas.py    Pydantic 输入/输出模型
   seed.py       启动演示数据
 examples/       curl 与 Python 调用示例
-tests/          算法单元测试与 API/并发/修订历史/先导关系/出口清点集成测试（pytest）
+tests/          算法单元测试与 API/并发/修订历史/先导关系/出口清点/逐段通行核报集成测试（pytest）
 ```
 
 本地运行测试：

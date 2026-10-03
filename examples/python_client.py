@@ -455,9 +455,90 @@ if __name__ == "__main__":
     show("多级关系（组3->组2->组1，按依赖顺序安排）", status, plan)
     summarize(plan)
 
+    # ---- 逐段实际通行核报（已出发人群组）----
+    # 两步路线 1->2(4 分钟)->6(2 分钟)：组1 计划 [0,4) 接 [4,6)
+    call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+            {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 10},
+        ],
+        "exits": [6], "closures": [],
+        "groups": [
+            {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 30},
+            # 组2 用于演示实绩重叠导致的超容量标注（计划会被错开）
+            {"id": 2, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 5, "deadline": 30},
+        ],
+    })
+    call("POST", "/tick", {"minutes": 7})
+
+    # 拒绝路径：未出发/通道不符/越序
+    status, payload = call("POST", "/passage-reports",
+                           {"serial": "PR-BAD1", "group_id": 99, "seq": 0,
+                            "edge_id": 1, "enter_minute": 0,
+                            "exit_minute": 4})
+    show("核报：组不存在（预期 422）", status, payload)
+    status, payload = call("POST", "/passage-reports",
+                           {"serial": "PR-BAD2", "group_id": 1, "seq": 0,
+                            "edge_id": 2, "enter_minute": 0,
+                            "exit_minute": 4})
+    show("核报：通道与现行段不符（预期 409 EDGE_MISMATCH）", status, payload)
+    status, payload = call("POST", "/passage-reports",
+                           {"serial": "PR-BAD3", "group_id": 1, "seq": 1,
+                            "edge_id": 2, "enter_minute": 4,
+                            "exit_minute": 6})
+    show("核报：越序（应先报 seq0，预期 409 OUT_OF_ORDER）", status, payload)
+
+    # 顺序核报：段0 与计划一致
+    status, payload = call("POST", "/passage-reports",
+                           {"serial": "PR-0001", "group_id": 1, "seq": 0,
+                            "edge_id": 1, "enter_minute": 0,
+                            "exit_minute": 4})
+    show("核报段0 实际[0,4)（HTTP 201）", status, payload)
+    # 幂等重试 -> 200；异内容 -> 409
+    status, payload = call("POST", "/passage-reports",
+                           {"serial": "PR-0001", "group_id": 1, "seq": 0,
+                            "edge_id": 1, "enter_minute": 0,
+                            "exit_minute": 4})
+    show("同报送号同内容重试（预期 HTTP 200 原记录）", status, payload)
+    status, payload = call("POST", "/passage-reports",
+                           {"serial": "PR-0001", "group_id": 1, "seq": 0,
+                            "edge_id": 1, "enter_minute": 0,
+                            "exit_minute": 5})
+    show("同报送号异内容（预期 409 SERIAL_CONTENT_MISMATCH）", status, payload)
+
+    # 段1 实绩偏离计划：实际 [5,7)（计划 [4,6)），仍受理并标注
+    status, payload = call("POST", "/passage-reports",
+                           {"serial": "PR-0002", "group_id": 1, "seq": 1,
+                            "edge_id": 2, "enter_minute": 5,
+                            "exit_minute": 7})
+    show("核报段1 实际[5,7)（偏离计划，照常留痕）", status, payload)
+
+    # 组2 实绩也在通道1 [0,4)：与组1 重叠 -> 20 人 > 容量 10 的超容量异常
+    status, payload = call("POST", "/passage-reports",
+                           {"serial": "PR-0101", "group_id": 2, "seq": 0,
+                            "edge_id": 1, "enter_minute": 0,
+                            "exit_minute": 4})
+    show("核报组2 实际[0,4)（与组1 重叠致超容量，仍受理）", status, payload)
+
+    status, payload = call("GET", "/passage-reports/groups/1")
+    show("单组并列视图：计划/实绩时刻、未核报段与逐段异常", status, payload)
+    for seg in payload["segments"]:
+        print(f"  段{seg['seq']} 通道{seg['edge_id']} "
+              f"计划[{seg['planned_enter_minute']},{seg['planned_exit_minute']}) "
+              f"实际[{seg['actual_enter_minute']},{seg['actual_exit_minute']}) "
+              f"已核报={seg['reported']} 偏离={seg['timing_deviation']} "
+              f"封闭={seg['closure_hit']} 超容量={seg['over_capacity']}")
+
+    status, payload = call("GET", "/passages/1/actual-load")
+    show("通道1 逐分钟实绩人数与异常（分钟0..3 used=20 over_capacity=true）",
+         status, payload)
+
     # ---- 修订历史：追溯每次编排变更 ----
     status, payload = call("GET", "/revisions")
-    show("修订列表（每次成功变更一条，拒绝不产生）", status, payload)
+    show("修订列表（核报不产生修订；每次成功编排变更一条，拒绝不产生）",
+         status, payload)
 
     latest = payload["revisions"][-1]["rev"]
     status, detail = call("GET", f"/revisions/{latest}")
