@@ -5,7 +5,7 @@
 # 重叠/超载拒绝、有效上限核验、组纠正、现场节点滞留报告（受理/拒绝/待救援）、
 # 人工救援队登记/派遣拒绝/派遣受理/结案核销、先导关系登记/替换/拒绝/前置
 # 未满足/多级依赖/人工送达锚点、出口清点（幂等登记/拒绝/更正/查询）、
-# 修订追溯。
+# 逐段实际通行核报（顺序核报/幂等/异常/滞留改编前缀保留/重置）、修订追溯。
 set -euo pipefail
 
 BASE="${1:-${BASE:-http://localhost:8000}}"
@@ -507,5 +507,146 @@ curl -s -X POST "$BASE/scenario" \
     ]
   }' > /dev/null
 curl -s "$BASE/exit-counts" | python3 -m json.tool
+
+# ---- 逐段实际通行核报（已出发组沿现行路线核报实际进入/离开分钟）----
+say "62) 重置为两段路线（1->2 四分钟、2->6 两分钟），推进到第6分钟：组1 fixed"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+      {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 10}
+    ],
+    "exits": [5, 6],
+    "closures": [],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30}
+    ]
+  }' > /dev/null
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 6}' > /dev/null
+curl -s "$BASE/plan" | python3 -m json.tool
+
+say "63) 核报校验：未出发不可核报；段不存在/通道不符/越序/离开晚于当前 均 409"
+# 重新造一个尚未出发的组 2 演示 NOT_DEPARTED
+curl -s -X POST "$BASE/groups" -H 'Content-Type: application/json' \
+  -d '[{"id": 2, "size": 5, "origin": 1, "earliest_departure": 10, "priority": 5, "deadline": 30}]' \
+  > /dev/null
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/traversal-reports" \
+  -H 'Content-Type: application/json' \
+  -d '{"report_id": "V-NA", "group_id": 2, "seq": 0, "edge_id": 1, "enter_minute": 0, "exit_minute": 4}'
+python3 -m json.tool /tmp/resp.json || true
+# 越序：先报 seq=1
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/traversal-reports" \
+  -H 'Content-Type: application/json' \
+  -d '{"report_id": "V-OO", "group_id": 1, "seq": 1, "edge_id": 2, "enter_minute": 4, "exit_minute": 6}'
+python3 -m json.tool /tmp/resp.json || true
+# 通道不符
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/traversal-reports" \
+  -H 'Content-Type: application/json' \
+  -d '{"report_id": "V-EM", "group_id": 1, "seq": 0, "edge_id": 2, "enter_minute": 0, "exit_minute": 4}'
+python3 -m json.tool /tmp/resp.json || true
+# 段不存在
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/traversal-reports" \
+  -H 'Content-Type: application/json' \
+  -d '{"report_id": "V-SN", "group_id": 1, "seq": 9, "edge_id": 1, "enter_minute": 0, "exit_minute": 4}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "64) 正式核报：组1 第0段（通道1）实际 [0,4)；偏离计划（计划[0,4)，无偏离）"
+curl -s -X POST "$BASE/traversal-reports" -H 'Content-Type: application/json' \
+  -d '{"report_id": "T-0001", "group_id": 1, "seq": 0, "edge_id": 1, "enter_minute": 0, "exit_minute": 4}' \
+  | python3 -m json.tool
+
+say "65) 核报第1段（通道2）实绩 [4,6)；顺序与时序校验（进入不早于前段离开）"
+curl -s -X POST "$BASE/traversal-reports" -H 'Content-Type: application/json' \
+  -d '{"report_id": "T-0002", "group_id": 1, "seq": 1, "edge_id": 2, "enter_minute": 4, "exit_minute": 6}' \
+  | python3 -m json.tool
+# 同段重复报送（换报送号）-> 409 DUPLICATE_SEQ
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/traversal-reports" \
+  -H 'Content-Type: application/json' \
+  -d '{"report_id": "T-DUP", "group_id": 1, "seq": 0, "edge_id": 1, "enter_minute": 0, "exit_minute": 4}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "66) 幂等：同报送号同内容重试 -> HTTP 200 返回原记录；异内容 -> 409"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/traversal-reports" \
+  -H 'Content-Type: application/json' \
+  -d '{"report_id": "T-0001", "group_id": 1, "seq": 0, "edge_id": 1, "enter_minute": 0, "exit_minute": 4}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/traversal-reports" \
+  -H 'Content-Type: application/json' \
+  -d '{"report_id": "T-0001", "group_id": 1, "seq": 0, "edge_id": 1, "enter_minute": 1, "exit_minute": 4}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "67) 查询：计划/实绩时刻并列、未核报段、通道逐分钟实绩人数与异常"
+curl -s "$BASE/traversal-reports/1" | python3 -m json.tool
+curl -s "$BASE/traversal-reports" | python3 -m json.tool
+
+say "68) 异常演示：实绩命中封闭（CLOSED）且合计超容量（OVER_CAPACITY 35>30），只留痕不改编排"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 30},
+      {"id": 2, "src": 2, "dst": 6, "minutes": 1, "capacity": 30}
+    ],
+    "exits": [6],
+    "closures": [{"edge_id": 1, "start_minute": 3, "end_minute": 10}],
+    "groups": [
+      {"id": 1, "size": 20, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30},
+      {"id": 2, "size": 15, "origin": 1, "earliest_departure": 0, "priority": 5, "deadline": 30}
+    ]
+  }' > /dev/null
+# 计划因封闭把两组排在第10分钟后；推进到第20分钟，两组均 fixed
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 20}' > /dev/null
+# 现场如实核报两组同一实绩区间 [2,6)：分钟3..5 命中封闭 CLOSED；
+# 分钟2..5 实绩合计 20+15=35 > 当时有效容量 30 -> OVER_CAPACITY
+curl -s -X POST "$BASE/traversal-reports" -H 'Content-Type: application/json' \
+  -d '{"report_id": "T-1001", "group_id": 1, "seq": 0, "edge_id": 1, "enter_minute": 2, "exit_minute": 6}' \
+  > /dev/null
+curl -s -X POST "$BASE/traversal-reports" -H 'Content-Type: application/json' \
+  -d '{"report_id": "T-1002", "group_id": 2, "seq": 0, "edge_id": 1, "enter_minute": 2, "exit_minute": 6}' \
+  > /dev/null
+curl -s "$BASE/traversal-reports" | python3 -c \
+  'import json,sys; d=json.load(sys.stdin); print(json.dumps([m for m in d["edge_minutes"] if m["anomalies"]], ensure_ascii=False, indent=2))'
+
+say "69) 节点滞留改编：固定前缀实绩保留，旧余程核报失效留痕，新余程重新核报"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+      {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 10}
+    ],
+    "exits": [5, 6],
+    "closures": [],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30}
+    ]
+  }' > /dev/null
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 4}' > /dev/null
+# 实绩比计划快：seq0 [0,2)、seq1 [2,4)
+curl -s -X POST "$BASE/traversal-reports" -H 'Content-Type: application/json' \
+  -d '{"report_id": "T-2001", "group_id": 1, "seq": 0, "edge_id": 1, "enter_minute": 0, "exit_minute": 2}' > /dev/null
+curl -s -X POST "$BASE/traversal-reports" -H 'Content-Type: application/json' \
+  -d '{"report_id": "T-2002", "group_id": 1, "seq": 1, "edge_id": 2, "enter_minute": 2, "exit_minute": 4}' > /dev/null
+# 在节点2报告滞留、第6分钟恢复：旧 seq1 核报被标记失效留痕
+curl -s -X POST "$BASE/groups/1/delay-report" -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "recovery_minute": 6}' | python3 -m json.tool
+curl -s "$BASE/traversal-reports/1" | python3 -m json.tool
+
+say "70) 场景重置清空本场全部实绩（核报台账归零、报送号可复用）"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [{"id": 1, "src": 1, "dst": 6, "minutes": 2, "capacity": 20}],
+    "exits": [6],
+    "closures": [],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30}
+    ]
+  }' > /dev/null
+curl -s "$BASE/traversal-reports" | python3 -m json.tool
 
 say "完成。交互文档： $BASE/docs"

@@ -42,6 +42,16 @@
   记录当前版本与非空原因把一条清点更正为非负人数（保留原值与更正历史，
   版本失配、对同一版本重复更正或更正后累计超额均整次拒绝）。清点与
   更正不改编排、不产生修订；场景重置清空全部清点记录。
+* 现场对已出发组逐段核报实际通行：每次提交唯一报送号、组号、现行路线段
+  序号与通道号、实际进入/离开分钟；分钟非负、进入早于离开且离开不晚于
+  当前分钟，同组沿路线顺序核报、后段进入不早于前段实际离开。段不存在、
+  通道不符、越序、同段重复或时序不符一律拒绝且不留记录；同报送号同内容
+  重试返回原记录、异内容拒绝。fixed 组核报全部现行段，待救援/救援中/
+  已人工送达组只核报已有通道前缀。节点滞留改编时已核报固定前缀保留可
+  查，被释放余程段的核报标记失效留痕、新余程重新核报。查询并列计划与
+  实绩时刻并按实绩汇总通道逐分钟人数，标出超当时有效容量或命中封闭的
+  异常；偏离或超额只留痕，不反向修改编排、占用、封闭/管制与修订；场景
+  重置清空本场全部实绩。
 
 修订历史
 ========
@@ -78,7 +88,10 @@ from .schemas import (CapacityControlIn, CapacityControlListOut,
                       RescueTaskListOut, RescueTaskOut, RescueTeamIn,
                       RescueTeamListOut, RescueTeamOut, RevisionDetailOut,
                       RevisionListOut, RevisionSummaryOut, ScenarioIn,
-                      StepOut)
+                      StepOut, TraversalActualStepOut, TraversalEdgeMinuteOut,
+                      TraversalGroupDetailOut, TraversalGroupOut,
+                      TraversalReportIn, TraversalReportListOut,
+                      TraversalRecordOut)
 from .seed import SEED_SCENARIO
 
 DB_PATH = os.getenv("EVAC_DB_PATH", "/data/evacuation.db")
@@ -110,12 +123,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.5.0",
+    version="1.6.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
                 "支持封闭时段、容量管制时段、每分钟容量约束、增量重排、"
                 "先导组放行间隔（多级依赖按依赖顺序安排）、"
-                "现场节点滞留报告与人工救援队交接核销，"
-                "以及出口按组清点实际撤离人数（幂等登记、版本化更正）。",
+                "现场节点滞留报告与人工救援队交接核销、"
+                "出口按组清点实际撤离人数（幂等登记、版本化更正），"
+                "以及已出发组逐段实际通行核报（顺序核报、幂等留痕、"
+                "封闭/超容量异常标出，不反向修改编排）。",
     lifespan=lifespan,
 )
 
@@ -623,6 +638,11 @@ async def _apply_delay_report(conn: aiosqlite.Connection, *,
         await conn.execute(
             "DELETE FROM route_steps WHERE group_id=? AND seq>=?",
             (group_id, k))
+        # 被释放余程段上已核报的逐段实绩不再对应现行路线：标记失效留痕
+        # （仍可查询、不再参与并列与逐分钟汇总）；已走前缀核报保持有效，
+        # 新余程可重新对同一 seq 核报
+        await db.detach_traversal_suffix(
+            conn, group_id=group_id, seq_from=k, minute=minute_now)
         await conn.execute(
             """UPDATE groups SET status='fixed', arrival_minute=NULL,
                exit_id=NULL, fail_reason=NULL, fail_detail=NULL
@@ -2030,6 +2050,400 @@ async def get_group_exit_counts(group_id: int, request: Request):
         tally = await _build_group_tally(conn, row, minute_now)
     return ExitCountGroupOut(current_minute=minute_now,
                              **tally.model_dump())
+
+
+# --------------------------------------------------------------------------
+# 逐段实际通行核报（已出发组沿现行路线逐段上报实际进入/离开分钟）
+# --------------------------------------------------------------------------
+
+# 可受理逐段核报的组状态：已出发并保留路线的组。scheduled/pending/failed/
+# blocked 为尚未出发（NOT_DEPARTED）；awaiting_rescue 已无余程，只能核报
+# 已保留的通道前缀（其 seq 仍在 route_steps 中）。
+_TRAVERSAL_DEPARTED_STATUSES = (
+    "fixed", "awaiting_rescue", "rescuing", "rescued")
+
+
+def _traversal_conflict(reason: str, message: str, payload,
+                        minute_now: int, *, extra: dict | None = None
+                        ) -> JSONResponse:
+    """构造统一的逐段核报拒绝响应（HTTP 409 + error/message/conflicts）。"""
+    conflict = {"report_id": payload.report_id,
+                "group_id": payload.group_id, "seq": payload.seq,
+                "edge_id": payload.edge_id,
+                "enter_minute": payload.enter_minute,
+                "exit_minute": payload.exit_minute,
+                "current_minute": minute_now, "reason": reason}
+    if extra:
+        conflict.update(extra)
+    return JSONResponse(
+        status_code=409,
+        content={"error": "TRAVERSAL_REPORT_NOT_ACCEPTABLE",
+                 "message": message, "conflicts": [conflict]})
+
+
+_TRAVERSAL_REJECTION_MESSAGES = {
+    "NOT_DEPARTED":
+        "该组尚未出发，逐段实际通行核报不受理，整次拒绝",
+    "STEP_NOT_FOUND":
+        "现行路线中不存在该序号的路段，整次拒绝（可能已被节点滞留改编，"
+        "请按现行路线重新核报）",
+    "EDGE_MISMATCH":
+        "核报通道与该段现行路线通道不符，整次拒绝",
+    "OUT_OF_ORDER":
+        "未按路线顺序核报：前序路段尚未核报，整次拒绝",
+    "DUPLICATE_SEQ":
+        "该段已核报，同段重复报送整次拒绝",
+    "ENTER_BEFORE_PREVIOUS_EXIT":
+        "本段实际进入分钟早于前段实际离开分钟，时序不符，整次拒绝",
+    "EXIT_IN_FUTURE":
+        "实际离开分钟晚于当前分钟，整次拒绝",
+}
+
+
+async def _load_group_steps(conn: aiosqlite.Connection, group_id: int):
+    """读取一组现行路线段（按 seq 升序）：seq/edge_id/from/to/enter/exit。"""
+    async with conn.execute(
+            """SELECT seq, edge_id, from_node, to_node, enter_minute,
+                      exit_minute
+               FROM route_steps WHERE group_id=? ORDER BY seq""",
+            (group_id,)) as cur:
+        return await cur.fetchall()
+
+
+async def _apply_traversal_report(conn: aiosqlite.Connection,
+                                  payload: TraversalReportIn):
+    """受理一次逐段实际通行核报（调用方已持锁）。
+
+    校验（任一不符整次拒绝、不留记录）：组已出发且仍保留现行路线段；
+    段序号存在；核报通道与现行路线该段通道一致；沿路线顺序核报（前序段
+    均已核报，同段不可重复）；本段进入不早于前段实际离开；离开不晚于
+    当前分钟。同一报送号同内容重试返回原记录，同号异内容整次拒绝。
+    核报仅留痕，不反向修改编排、占用与容量管制，也不产生修订。
+    """
+    minute_now = await db.get_current_minute(conn)
+
+    # 幂等优先：同一报送号同内容重试返回原记录；异内容整次拒绝
+    existing = await db.load_traversal_report(conn, payload.report_id)
+    if existing is not None:
+        same = (existing["group_id"] == payload.group_id
+                and existing["seq"] == payload.seq
+                and existing["edge_id"] == payload.edge_id
+                and existing["enter_minute"] == payload.enter_minute
+                and existing["exit_minute"] == payload.exit_minute)
+        if same:
+            return JSONResponse(
+                status_code=200,
+                content=(await _traversal_record_out(conn, payload.report_id)
+                         ).model_dump())
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "TRAVERSAL_REPORT_ID_CONFLICT",
+                "message": "报送号已使用且提交内容不一致，整次拒绝",
+                "conflicts": [{
+                    "report_id": payload.report_id,
+                    "reason": "REPORT_ID_CONTENT_MISMATCH",
+                    "current_minute": minute_now,
+                    "existing": {
+                        "group_id": existing["group_id"],
+                        "seq": existing["seq"],
+                        "edge_id": existing["edge_id"],
+                        "enter_minute": existing["enter_minute"],
+                        "exit_minute": existing["exit_minute"]}}]})
+
+    async with conn.execute(
+            "SELECT status FROM groups WHERE id=?",
+            (payload.group_id,)) as cur:
+        group_row = await cur.fetchone()
+    if group_row is None:
+        raise HTTPException(422, f"人群组 {payload.group_id} 不存在")
+    status = group_row[0]
+    if status not in _TRAVERSAL_DEPARTED_STATUSES:
+        return _traversal_conflict(
+            "NOT_DEPARTED", _TRAVERSAL_REJECTION_MESSAGES["NOT_DEPARTED"],
+            payload, minute_now, extra={"status": status})
+
+    steps = await _load_group_steps(conn, payload.group_id)
+    step_by_seq = {s[0]: s for s in steps}
+    step = step_by_seq.get(payload.seq)
+    if step is None:
+        # 待救援/救援中/已救援组只有已走通道前缀，其后序号不存在；
+        # fixed 组则可能因节点滞留改编使该序号对应别的段，按现行路线核对
+        return _traversal_conflict(
+            "STEP_NOT_FOUND", _TRAVERSAL_REJECTION_MESSAGES["STEP_NOT_FOUND"],
+            payload, minute_now,
+            extra={"status": status, "max_seq": steps[-1][0] if steps else None})
+    _, planned_edge, from_node, to_node, plan_enter, plan_exit = step
+    if planned_edge != payload.edge_id:
+        return _traversal_conflict(
+            "EDGE_MISMATCH", _TRAVERSAL_REJECTION_MESSAGES["EDGE_MISMATCH"],
+            payload, minute_now,
+            extra={"status": status, "expected_edge_id": planned_edge,
+                   "from_node": from_node, "to_node": to_node})
+
+    active_reports = {
+        r["seq"]: r
+        for r in await db.load_traversal_reports(
+            conn, payload.group_id, active_only=True)}
+    if payload.seq in active_reports:
+        prior = active_reports[payload.seq]
+        return _traversal_conflict(
+            "DUPLICATE_SEQ", _TRAVERSAL_REJECTION_MESSAGES["DUPLICATE_SEQ"],
+            payload, minute_now,
+            extra={"existing_report_id": prior["report_id"],
+                   "enter_minute": prior["enter_minute"],
+                   "exit_minute": prior["exit_minute"]})
+    # 沿路线顺序：前序段（seq-1）须已核报；不允许跳段
+    if payload.seq > 0 and payload.seq - 1 not in active_reports:
+        return _traversal_conflict(
+            "OUT_OF_ORDER", _TRAVERSAL_REJECTION_MESSAGES["OUT_OF_ORDER"],
+            payload, minute_now,
+            extra={"expected_seq": _next_expected_seq(active_reports)})
+    # 后段进入不得早于前段离开
+    if payload.seq > 0:
+        prev = active_reports[payload.seq - 1]
+        if payload.enter_minute < prev["exit_minute"]:
+            return _traversal_conflict(
+                "ENTER_BEFORE_PREVIOUS_EXIT",
+                _TRAVERSAL_REJECTION_MESSAGES[
+                    "ENTER_BEFORE_PREVIOUS_EXIT"],
+                payload, minute_now,
+                extra={"previous_report_id": prev["report_id"],
+                       "previous_exit_minute": prev["exit_minute"]})
+    # 实际离开不晚于当前分钟（进入早于离开由 pydantic 模型保证）
+    if payload.exit_minute > minute_now:
+        return _traversal_conflict(
+            "EXIT_IN_FUTURE", _TRAVERSAL_REJECTION_MESSAGES["EXIT_IN_FUTURE"],
+            payload, minute_now)
+
+    async with db.transaction(conn):
+        await db.insert_traversal_report(
+            conn, report_id=payload.report_id, group_id=payload.group_id,
+            seq=payload.seq, edge_id=payload.edge_id,
+            enter_minute=payload.enter_minute,
+            exit_minute=payload.exit_minute, reported_minute=minute_now)
+    record = await _traversal_record_out(conn, payload.report_id)
+    return JSONResponse(status_code=201, content=record.model_dump())
+
+
+def _next_expected_seq(active_reports: dict[int, dict]) -> int:
+    """下一个应核报的段序号：从 0 起首个未核报的序号。"""
+    seq = 0
+    while seq in active_reports:
+        seq += 1
+    return seq
+
+
+async def _traversal_record_out(conn: aiosqlite.Connection,
+                                report_id: str) -> TraversalRecordOut:
+    rec = await db.load_traversal_report(conn, report_id)
+    return TraversalRecordOut(**rec)
+
+
+def _segments_intersect(a0: int, a1: int, b0: int, b1: int) -> bool:
+    """左闭右开区间 [a0,a1) 与 [b0,b1) 是否相交。"""
+    return a0 < b1 and b0 < a1
+
+
+async def _build_traversal_edge_minutes(
+        conn: aiosqlite.Connection,
+        reports: list[dict]) -> tuple[list[TraversalEdgeMinuteOut], dict]:
+    """按已核报（仍有效）实绩汇总通道逐分钟人数并标出异常。
+
+    仅统计实际通行区间 [enter, exit) 内逐分钟的实绩人数（不看计划占用）：
+    超过该分钟当时有效容量（容量管制时为 min(原容量, 管制上限)）标
+    OVER_CAPACITY；实绩区间命中通道封闭的分钟标 CLOSED。返回逐分钟列表
+    （按通道、分钟升序）与 (edge_id, minute) -> anomalies 映射，供段级
+    异常标记复用。
+    """
+    async with conn.execute(
+            "SELECT id, capacity FROM edges") as cur:
+        base_caps = {eid: cap for eid, cap in await cur.fetchall()}
+    controls: dict[int, list[tuple[int, int, int]]] = {}
+    async with conn.execute(
+            "SELECT edge_id, start_minute, end_minute, capacity "
+            "FROM capacity_controls ORDER BY edge_id, start_minute") as cur:
+        for eid, a, b, cap in await cur.fetchall():
+            controls.setdefault(eid, []).append((a, b, cap))
+    closures: dict[int, list[tuple[int, int]]] = {}
+    async with conn.execute(
+            "SELECT edge_id, start_minute, end_minute FROM closures") as cur:
+        for eid, a, b in await cur.fetchall():
+            closures.setdefault(eid, []).append((a, b))
+    async with conn.execute("SELECT id, size FROM groups") as cur:
+        sizes = {gid: size for gid, size in await cur.fetchall()}
+
+    per_minute: dict[tuple[int, int], dict] = {}
+    for rec in reports:
+        if not rec["active"]:
+            continue
+        eid, size = rec["edge_id"], sizes.get(rec["group_id"], 0)
+        for minute in range(rec["enter_minute"], rec["exit_minute"]):
+            slot = per_minute.setdefault(
+                (eid, minute),
+                {"groups": {}, "closed": False})
+            slot["groups"][rec["group_id"]] = size
+            for a, b in closures.get(eid, ()):
+                if a <= minute < b:
+                    slot["closed"] = True
+                    break
+
+    minutes_out: list[TraversalEdgeMinuteOut] = []
+    anomaly_map: dict[tuple[int, int], list[str]] = {}
+    for eid, minute in sorted(per_minute):
+        slot = per_minute[(eid, minute)]
+        used = sum(slot["groups"].values())
+        cap = effective_capacity(
+            base_caps.get(eid, 0), controls.get(eid, ()), minute)
+        anomalies = []
+        if used > cap:
+            anomalies.append("OVER_CAPACITY")
+        if slot["closed"]:
+            anomalies.append("CLOSED")
+        anomaly_map[(eid, minute)] = anomalies
+        minutes_out.append(TraversalEdgeMinuteOut(
+            edge_id=eid, minute=minute, used=used,
+            effective_capacity=cap,
+            groups=[{"group_id": gid, "size": gsize}
+                    for gid, gsize in sorted(slot["groups"].items())],
+            anomalies=anomalies))
+    return minutes_out, anomaly_map
+
+
+async def _build_traversal_group(
+        conn: aiosqlite.Connection, group_id: int, status: str, size: int,
+        prefix_step_count: int | None,
+        anomaly_map: dict[tuple[int, int], list[str]]
+        ) -> TraversalGroupOut:
+    """组装单组的计划/实绩并列段、未核报段与全部核报记录（含失效留痕）。"""
+    steps = await _load_group_steps(conn, group_id)
+    all_reports = await db.load_traversal_reports(conn, group_id)
+    active_by_seq = {r["seq"]: r for r in all_reports if r["active"]}
+    step_out: list[TraversalActualStepOut] = []
+    for seq, eid, fnode, tnode, p_enter, p_exit in steps:
+        rec = active_by_seq.get(seq)
+        anomalies = []
+        if rec is not None:
+            hit_minutes = set()
+            for minute in range(rec["enter_minute"], rec["exit_minute"]):
+                for code in anomaly_map.get((eid, minute), ()):
+                    hit_minutes.add(code)
+            anomalies = sorted(hit_minutes)
+        step_out.append(TraversalActualStepOut(
+            seq=seq, edge_id=eid, from_node=fnode, to_node=tnode,
+            planned_enter_minute=p_enter, planned_exit_minute=p_exit,
+            actual_enter_minute=(rec or {}).get("enter_minute"),
+            actual_exit_minute=(rec or {}).get("exit_minute"),
+            report_id=(rec or {}).get("report_id"),
+            deviates=(rec is not None and (
+                rec["enter_minute"] != p_enter
+                or rec["exit_minute"] != p_exit)),
+            anomalies=anomalies))
+    unreported = [s[0] for s in steps if s[0] not in active_by_seq]
+    # 未出发组尚不可核报：不把计划段列为未核报段（其路线仍可能整体重排）
+    if status not in _TRAVERSAL_DEPARTED_STATUSES:
+        unreported = []
+    next_seq = unreported[0] if unreported else None
+    return TraversalGroupOut(
+        group_id=group_id, status=status, size=size,
+        prefix_step_count=prefix_step_count,
+        steps=step_out, unreported_seqs=unreported, next_seq=next_seq,
+        reports=[TraversalRecordOut(**r) for r in all_reports if r["active"]],
+        detached_reports=[TraversalRecordOut(**r)
+                          for r in all_reports if not r["active"]])
+
+
+async def _build_traversal_response(conn: aiosqlite.Connection,
+                                   group_id: int | None = None):
+    """组装逐段核报查询：各段计划/实绩并列、未核报段与通道逐分钟实绩汇总。"""
+    minute_now = await db.get_current_minute(conn)
+    prefixes = await db.load_delay_prefixes(conn)
+    active_reports = await db.load_traversal_reports(conn, active_only=True)
+    edge_minutes, anomaly_map = await _build_traversal_edge_minutes(
+        conn, active_reports)
+
+    async with conn.execute(
+            "SELECT id, status, size FROM groups "
+            "ORDER BY priority DESC, earliest_departure ASC, id ASC") as cur:
+        group_rows = await cur.fetchall()
+    groups_out: list[TraversalGroupOut] = []
+    for gid, status, size in group_rows:
+        if group_id is not None and gid != group_id:
+            continue
+        groups_out.append(await _build_traversal_group(
+            conn, gid, status, size, prefixes.get(gid),
+            anomaly_map))
+
+    if group_id is not None:
+        # 单组视图：edge_minutes 只保留与该组现行路线及实绩相关的通道分钟
+        related_edges = {s.edge_id for g in groups_out for s in g.steps}
+        related_edges |= {r["edge_id"] for r in active_reports
+                          if r["group_id"] == group_id}
+        group_minutes = [m for m in edge_minutes
+                         if m.edge_id in related_edges]
+        return TraversalGroupDetailOut(
+            current_minute=minute_now, **groups_out[0].model_dump(),
+            edge_minutes=group_minutes)
+    return TraversalReportListOut(
+        current_minute=minute_now, groups=groups_out,
+        edge_minutes=edge_minutes)
+
+
+@app.post("/traversal-reports", tags=["逐段通行核报"],
+          response_model=TraversalRecordOut, status_code=201,
+          responses={
+              200: {"description": "同报送号同内容的幂等重试，返回原记录"},
+              409: {"description": "报送号异内容/组未出发/段不存在/通道不符/"
+                                   "越序/同段重复/时序不符，整次拒绝"},
+              422: {"description": "报送号为空、分钟非法（负或进入不早于离开）"
+                                   "或组不存在"}})
+async def submit_traversal_report(payload: TraversalReportIn, request: Request):
+    """现场核报已出发组沿现行路线某段的**实际**进入/离开分钟。
+
+    每次提交唯一报送号、组号、现行路线段序号（从 0 起）与通道号、实际
+    进入与离开分钟：分钟非负、进入早于离开且离开不晚于当前分钟；同组须
+    沿路线顺序核报，后段进入不得早于前段实际离开。路线段不存在
+    （``STEP_NOT_FOUND``）、通道不符（``EDGE_MISMATCH``）或越序
+    （``OUT_OF_ORDER``；同段重复为 ``DUPLICATE_SEQ``）时报错且不留记录；
+    同一报送号同内容重试返回原记录（HTTP 200），同号异内容或同段重复
+    报送拒绝（409）。
+
+    节点滞留改编后，已核报的固定前缀仍可查（继续参与并列展示与汇总），
+    被释放余程段的旧核报标记失效留痕，后续按新余程重新核报；人工救援
+    （救援中/已送达）组只核报其已有的通道前缀。偏离计划时刻、命中封闭或
+    实绩超当时有效容量均如实留痕并在查询中标出异常，**不**反向修改编排、
+    通道占用、容量管制或修订。场景重置清空本场全部实绩。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        return await _apply_traversal_report(conn, payload)
+
+
+@app.get("/traversal-reports", tags=["逐段通行核报"],
+         response_model=TraversalReportListOut)
+async def list_traversal_reports(request: Request):
+    """并列各段计划与实绩时刻、列出未核报段，并按已核报实绩汇总通道逐分钟
+    人数，标出超出当时有效容量（``OVER_CAPACITY``）或命中封闭（``CLOSED``）
+    的异常分钟。只统计仍对应现行路线的有效核报；节点滞留改编失效的历史
+    核报在各组 ``detached_reports`` 中留痕。"""
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        return await _build_traversal_response(conn)
+
+
+@app.get("/traversal-reports/{group_id}", tags=["逐段通行核报"],
+         response_model=TraversalGroupDetailOut,
+         responses={404: {"description": "人群组不存在"}})
+async def get_group_traversal_reports(group_id: int, request: Request):
+    """单组逐段核报台账：各段计划/实绩时刻并列、未核报段、全部核报记录
+    （含失效留痕）及与该组相关通道的逐分钟实绩人数与异常。"""
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        async with conn.execute("SELECT 1 FROM groups WHERE id=?",
+                                (group_id,)) as cur:
+            if await cur.fetchone() is None:
+                raise HTTPException(404, f"人群组 {group_id} 不存在")
+        return await _build_traversal_response(conn, group_id=group_id)
 
 
 @app.post("/tick", tags=["时间"], response_model=PlanResponse)

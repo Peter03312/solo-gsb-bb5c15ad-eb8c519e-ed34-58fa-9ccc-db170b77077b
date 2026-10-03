@@ -149,6 +149,27 @@ CREATE TABLE IF NOT EXISTS exit_count_corrections (
 CREATE INDEX IF NOT EXISTS idx_exit_count_corrections_serial
     ON exit_count_corrections(serial);
 
+-- 逐段实际通行核报：现场对已出发组沿现行路线逐段上报的实际进入/离开分钟。
+-- report_id 为全库唯一报送号（幂等键）：同号同内容重试返回原记录，异内容
+-- 拒绝。(group_id, seq) 对"仍有效（active=1）"记录唯一：同段重复报送拒绝；
+-- 节点滞留改编释放某段时把对应记录置 active=0（历史留痕、可查，不参与逐
+-- 分钟汇总与计划/实绩并列），改编后的新余程可重新占用同一 seq。
+CREATE TABLE IF NOT EXISTS traversal_reports (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id       TEXT NOT NULL UNIQUE,
+    group_id        INTEGER NOT NULL,
+    seq             INTEGER NOT NULL,
+    edge_id         INTEGER NOT NULL,
+    enter_minute    INTEGER NOT NULL,
+    exit_minute     INTEGER NOT NULL,
+    reported_minute INTEGER NOT NULL,
+    active          INTEGER NOT NULL DEFAULT 1,
+    detached_minute INTEGER,
+    detach_reason   TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_traversal_reports_active_step
+    ON traversal_reports(group_id, seq) WHERE active=1;
+
 -- 修订历史：每次成功的编排变更（场景重置/新增组/纠正组/登记封闭/
 -- 登记容量管制/现场节点滞留报告/推进时间）与编排变更在同一事务内写入；
 -- 快照为提交时刻的完整编排 JSON，落库后不再改动、查询时不按当前场景重算。
@@ -182,10 +203,11 @@ async def reset_db(db: aiosqlite.Connection) -> None:
     修订号继续全局递增。
     """
     # 人工救援队与其救援任务随场景重置清空；先导关系与出口清点记录（含更正
-    # 历史）亦清空；修订历史不在清空之列
+    # 历史）亦清空；逐段实际通行核报记录同样清空；修订历史不在清空之列
     for table in ("rescue_tasks", "rescue_teams",
                   "delay_reports", "group_prerequisites",
                   "exit_count_corrections", "exit_counts",
+                  "traversal_reports",
                   "route_steps", "groups", "closures",
                   "capacity_controls", "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
@@ -658,6 +680,87 @@ async def load_exit_count_corrections(db: aiosqlite.Connection,
     return [{"from_version": r[0], "to_version": r[1], "old_count": r[2],
              "new_count": r[3], "reason": r[4], "minute": r[5]}
             for r in rows]
+
+
+# --------------------------------------------------------------------------
+# 逐段实际通行核报
+# --------------------------------------------------------------------------
+
+_TRAVERSAL_COLUMNS = ("report_id", "group_id", "seq", "edge_id",
+                      "enter_minute", "exit_minute", "reported_minute",
+                      "active", "detached_minute", "detach_reason")
+
+
+def _traversal_row(row) -> dict:
+    return {"report_id": row[0], "group_id": row[1], "seq": row[2],
+            "edge_id": row[3], "enter_minute": row[4],
+            "exit_minute": row[5], "reported_minute": row[6],
+            "active": bool(row[7]), "detached_minute": row[8],
+            "detach_reason": row[9]}
+
+
+_TRAVERSAL_SELECT = (
+    "SELECT report_id, group_id, seq, edge_id, enter_minute, exit_minute, "
+    "reported_minute, active, detached_minute, detach_reason "
+    "FROM traversal_reports")
+
+
+async def insert_traversal_report(db: aiosqlite.Connection, *,
+                                  report_id: str, group_id: int, seq: int,
+                                  edge_id: int, enter_minute: int,
+                                  exit_minute: int,
+                                  reported_minute: int) -> None:
+    """登记一条有效的逐段通行核报（调用方负责事务与全部受理校验）。"""
+    await db.execute(
+        """INSERT INTO traversal_reports
+           (report_id, group_id, seq, edge_id, enter_minute, exit_minute,
+            reported_minute, active)
+           VALUES(?,?,?,?,?,?,?,1)""",
+        (report_id, group_id, seq, edge_id, enter_minute, exit_minute,
+         reported_minute))
+
+
+async def load_traversal_report(db: aiosqlite.Connection,
+                                report_id: str) -> dict | None:
+    """按报送号读取一条核报记录（含已失效留痕）；不存在返回 None。"""
+    async with db.execute(
+            f"{_TRAVERSAL_SELECT} WHERE report_id=?", (report_id,)) as cur:
+        row = await cur.fetchone()
+    return None if row is None else _traversal_row(row)
+
+
+async def load_traversal_reports(db: aiosqlite.Connection,
+                                 group_id: int | None = None,
+                                 *, active_only: bool = False) -> list[dict]:
+    """按受理先后列出核报记录；可限定组，或仅取仍有效（对应当前路线）记录。"""
+    clauses = []
+    params: list = []
+    if group_id is not None:
+        clauses.append("group_id=?")
+        params.append(group_id)
+    if active_only:
+        clauses.append("active=1")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    async with db.execute(
+            f"{_TRAVERSAL_SELECT}{where} ORDER BY id", params) as cur:
+        rows = await cur.fetchall()
+    return [_traversal_row(r) for r in rows]
+
+
+async def detach_traversal_suffix(db: aiosqlite.Connection, *, group_id: int,
+                                  seq_from: int, minute: int) -> None:
+    """节点滞留改编时，把该组 seq >= seq_from 的仍有效核报标记为失效留痕。
+
+    被释放的旧余程段不再属于现行路线，对应核报不再参与计划/实绩并列与
+    逐分钟实绩汇总，但记录保留可查（active=0，附失效分钟与原因）；
+    改编后的新余程可重新对同一 seq 核报。已走前缀（seq < seq_from）的
+    核报保持有效。调用方负责事务。
+    """
+    await db.execute(
+        """UPDATE traversal_reports SET active=0, detached_minute=?,
+           detach_reason='delay-replan'
+           WHERE group_id=? AND seq>=? AND active=1""",
+        (minute, group_id, seq_from))
 
 
 # --------------------------------------------------------------------------

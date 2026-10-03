@@ -455,6 +455,82 @@ if __name__ == "__main__":
     show("多级关系（组3->组2->组1，按依赖顺序安排）", status, plan)
     summarize(plan)
 
+    # ---- 逐段实际通行核报：已出发组沿现行路线逐段核报实际时刻 ----
+    call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+            {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 10},
+        ],
+        "exits": [5, 6], "closures": [],
+        "groups": [
+            {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 30},
+            {"id": 2, "size": 5, "origin": 1, "earliest_departure": 10,
+             "priority": 5, "deadline": 30},
+        ],
+    })
+    call("POST", "/tick", {"minutes": 6})
+
+    def traversal(report_id, gid, seq, edge_id, enter, leave):
+        return call("POST", "/traversal-reports",
+                    {"report_id": report_id, "group_id": gid, "seq": seq,
+                     "edge_id": edge_id, "enter_minute": enter,
+                     "exit_minute": leave})
+
+    # 拒绝路径：未出发 / 越序 / 通道不符 / 段不存在
+    status, payload = traversal("PY-NA", 2, 0, 1, 0, 4)
+    show("未出发组核报（预期 409 NOT_DEPARTED）", status, payload)
+    status, payload = traversal("PY-OO", 1, 1, 2, 4, 6)
+    show("越序核报 seq=1（预期 409 OUT_OF_ORDER）", status, payload)
+    status, payload = traversal("PY-EM", 1, 0, 2, 0, 4)
+    show("通道不符（预期 409 EDGE_MISMATCH）", status, payload)
+
+    # 顺序核报两段
+    status, payload = traversal("PY-T1", 1, 0, 1, 0, 4)
+    show("核报 seq=0 通道1 实际 [0,4)", status, payload)
+    status, replay = traversal("PY-T1", 1, 0, 1, 0, 4)
+    print(f"\n同报送号同内容重试： HTTP {status}（幂等返回原记录）")
+    status, payload = traversal("PY-T2", 1, 1, 2, 4, 6)
+    show("核报 seq=1 通道2 实际 [4,6)", status, payload)
+    status, payload = traversal("PY-DUP", 1, 0, 1, 0, 4)
+    show("同段重复报送（预期 409 DUPLICATE_SEQ）", status, payload)
+
+    status, payload = call("GET", "/traversal-reports/1")
+    show("单组计划/实绩并列、未核报段与逐分钟实绩", status, payload)
+    for s in payload["steps"]:
+        print(f"  seq={s['seq']} 通道{s['edge_id']} "
+              f"计划[{s['planned_enter_minute']},{s['planned_exit_minute']}) "
+              f"实绩[{s['actual_enter_minute']},{s['actual_exit_minute']}) "
+              f"偏离={s['deviates']} 异常={s['anomalies']}")
+    status, payload = call("GET", "/traversal-reports")
+    show("全部组逐段台账 + 通道逐分钟实绩人数与异常", status, payload)
+    print("  异常分钟：", [(m["edge_id"], m["minute"], m["anomalies"])
+                        for m in payload["edge_minutes"] if m["anomalies"]])
+
+    # 节点滞留改编：固定前缀保留、旧余程核报失效留痕、新余程重报
+    call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+            {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 10},
+        ],
+        "exits": [5, 6], "closures": [],
+        "groups": [
+            {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 30}],
+    })
+    call("POST", "/tick", {"minutes": 4})
+    traversal("PY-R1", 1, 0, 1, 0, 2)
+    traversal("PY-R2", 1, 1, 2, 2, 4)
+    status, plan = call("POST", "/groups/1/delay-report",
+                        {"node_id": 2, "recovery_minute": 6})
+    show("节点2滞留、第6分钟恢复（旧 seq1 核报将失效留痕）", status, plan)
+    status, payload = call("GET", "/traversal-reports/1")
+    show("改编后：前缀实绩保留、失效记录在 detached_reports", status, payload)
+    print("  有效核报：", [(r["report_id"], r["seq"])
+                        for r in payload["reports"]])
+    print("  失效留痕：", [(r["report_id"], r["seq"], r["detach_reason"])
+                        for r in payload["detached_reports"]])
+
     # ---- 修订历史：追溯每次编排变更 ----
     status, payload = call("GET", "/revisions")
     show("修订列表（每次成功变更一条，拒绝不产生）", status, payload)

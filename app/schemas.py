@@ -248,6 +248,127 @@ class ExitCountGroupOut(GroupTallyOut):
     current_minute: int
 
 
+# --------------------------------------------------------------------------
+# 逐段实际通行核报（已出发组沿现行路线逐段上报实际进入/离开分钟）
+# --------------------------------------------------------------------------
+
+class TraversalReportIn(BaseModel):
+    """逐段实际通行核报：唯一报送号 + 组号 + 现行路线段序号 + 通道号 + 时刻。"""
+    report_id: str = Field(
+        ..., min_length=1,
+        description="唯一报送号（幂等键：同号同内容重试返回原记录，"
+                    "同号异内容整次拒绝）")
+    group_id: int = Field(..., ge=1, description="已出发人群组编号")
+    seq: int = Field(..., ge=0,
+                     description="现行路线段序号（从 0 起，须沿路线顺序核报）")
+    edge_id: int = Field(..., ge=1, description="该段实际通行的通道编号（须与现行路线一致）")
+    enter_minute: int = Field(..., ge=0, description="实际进入分钟（非负，早于离开分钟）")
+    exit_minute: int = Field(..., ge=0,
+                             description="实际离开分钟（不晚于当前分钟；不早于前段离开）")
+
+    @model_validator(mode="after")
+    def _enter_before_exit(self):
+        if self.exit_minute <= self.enter_minute:
+            raise ValueError("实际离开分钟必须晚于实际进入分钟")
+        return self
+
+
+class TraversalActualStepOut(BaseModel):
+    """现行路线中一段的计划时刻与实绩时刻并列。"""
+    seq: int = Field(description="现行路线段序号（从 0 起）")
+    edge_id: int
+    from_node: int
+    to_node: int
+    planned_enter_minute: Optional[int] = Field(
+        None, description="计划进入分钟（现行编排）")
+    planned_exit_minute: Optional[int] = Field(
+        None, description="计划离开分钟（现行编排）")
+    actual_enter_minute: Optional[int] = Field(
+        None, description="实际进入分钟（已核报给出；未核报为 null）")
+    actual_exit_minute: Optional[int] = Field(
+        None, description="实际离开分钟（已核报给出；未核报为 null）")
+    report_id: Optional[str] = Field(
+        None, description="该段实绩对应的报送号（未核报为 null）")
+    deviates: bool = Field(
+        False, description="实绩时刻是否偏离计划时刻（任一时刻不同即偏离）")
+    anomalies: list[str] = Field(
+        default_factory=list,
+        description="该段实绩异常标记：CLOSED=实绩区间命中通道封闭；"
+                    "OVER_CAPACITY=实绩区间某分钟实绩人数超当时有效容量")
+
+
+class TraversalRecordOut(BaseModel):
+    """一条逐段通行核报记录（幂等登记，永不因编排改动而删除）。"""
+    report_id: str
+    group_id: int
+    seq: int
+    edge_id: int
+    enter_minute: int = Field(description="实际进入分钟")
+    exit_minute: int = Field(description="实际离开分钟")
+    reported_minute: int = Field(description="受理核报时的当前分钟")
+    active: bool = Field(
+        True,
+        description="是否仍对应当前现行路线的段；节点滞留改编释放该段后"
+                    "置为 false（历史留痕，不参与逐分钟汇总与并列展示）")
+    detached_minute: Optional[int] = Field(
+        None, description="被节点滞留改编标记为失效时的当前分钟（active 时为 null）")
+    detach_reason: Optional[str] = Field(
+        None, description="失效原因（delay-replan：节点滞留改编释放该段）")
+
+
+class TraversalGroupOut(BaseModel):
+    """单组逐段计划/实绩并列、未核报段与核报记录。"""
+    group_id: int
+    status: str
+    size: int
+    prefix_step_count: Optional[int] = Field(
+        None, description="已走固定前缀步数（被节点滞留改编过的组给出）")
+    steps: list[TraversalActualStepOut] = Field(
+        default_factory=list,
+        description="现行路线各段：计划与实绩时刻并列（未核报段实绩为 null）")
+    unreported_seqs: list[int] = Field(
+        default_factory=list, description="尚未核报的现行路线段序号（按序号升序）")
+    next_seq: Optional[int] = Field(
+        None, description="下一个应核报的段序号（全部核报完为 null）")
+    reports: list[TraversalRecordOut] = Field(
+        default_factory=list,
+        description="该组全部核报记录（按受理先后，含已失效留痕）")
+    detached_reports: list[TraversalRecordOut] = Field(
+        default_factory=list,
+        description="因节点滞留改编而不再对应现行路线的历史核报记录")
+
+
+class TraversalEdgeMinuteOut(BaseModel):
+    """某通道某分钟按已核报实绩汇总的人数与异常标记。"""
+    edge_id: int
+    minute: int
+    used: int = Field(description="该分钟在该通道上的实绩总人数（仅已核报实绩）")
+    effective_capacity: int = Field(
+        description="当时有效容量（容量管制时段内为 min(原容量, 管制上限)）")
+    groups: list[dict] = Field(
+        default_factory=list,
+        description="贡献实绩人数的组：group_id/size")
+    anomalies: list[str] = Field(
+        default_factory=list,
+        description="异常标记：OVER_CAPACITY=实绩人数超当时有效容量；"
+                    "CLOSED=该分钟命中通道封闭")
+
+
+class TraversalGroupDetailOut(TraversalGroupOut):
+    current_minute: int
+    edge_minutes: list[TraversalEdgeMinuteOut] = Field(
+        default_factory=list,
+        description="与该组实绩相关的通道逐分钟实绩人数汇总")
+
+
+class TraversalReportListOut(BaseModel):
+    current_minute: int
+    groups: list[TraversalGroupOut]
+    edge_minutes: list[TraversalEdgeMinuteOut] = Field(
+        default_factory=list,
+        description="全部通道按已核报实绩汇总的逐分钟人数（标出超容量/封闭异常）")
+
+
 class GroupIn(BaseModel):
     id: int = Field(..., ge=1, description="人群组编号（正整数，唯一）")
     size: int = Field(..., gt=0, description="人数（正整数，整组不可拆分）")

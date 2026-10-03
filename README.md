@@ -25,6 +25,13 @@
 或已由人工救援实际送达该出口的组可登记，同组累计不超组人数；可凭原
 流水号、记录版本与非空原因**更正**为非负人数（保留原值与更正历史），
 并按组查询应到/已清点/未清点人数与逐条记录。
+支持现场对已出发人群组**逐段核报实际通行**：每次提交唯一报送号、组号、
+现行路线段序号与通道号、实际进入和离开分钟，沿路线顺序核报；同号同内容
+重试返回原记录，异内容或同段重复报送拒绝，段不存在/通道不符/越序时报错
+且不留记录。节点滞留改编后已核报固定前缀仍可查、后续按新余程核报，人工
+救援组只核报已有通道前缀。查询并列各段计划与实绩时刻、未核报段，并按
+已核报实绩汇总通道逐分钟人数，标出超出当时有效容量或命中封闭的异常；
+偏离或超额只留痕，不反向修改编排、占用或修订；场景重置清空本场实绩。
 每次成功的编排变更都会落库一条**全局递增修订**（前后完整快照 + 逐组差异），
 供指挥员追溯"每次疏散变更为何改动编排"。
 
@@ -94,6 +101,9 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/exit-counts/{serial}/correction` | 凭原流水号+记录版本+非空原因更正为非负人数（保留原值与历史）；版本失配/重复更正/超额 **409**，未知流水号 **404** |
 | GET | `/exit-counts` | 按组列出应到/已清点/未清点人数及逐条记录（含更正历史） |
 | GET | `/exit-counts/{group_id}` | 单组清点台账；未知组号 **404** |
+| POST | `/traversal-reports` | 逐段核报已出发组的实际通行（唯一报送号+组号+段序号+通道号+实际进入/离开分钟）；同号同内容重试返回原记录，异内容/同段重复/未出发/段不存在/通道不符/越序/时序冲突 **409**，参数非法或组不存在 **422** |
+| GET | `/traversal-reports` | 并列各段计划与实绩时刻、未核报段，按已核报实绩汇总通道逐分钟人数并标出超容量/封闭异常 |
+| GET | `/traversal-reports/{group_id}` | 单组逐段核报台账（计划/实绩并列、未核报段、核报记录与失效留痕、相关通道逐分钟实绩）；未知组号 **404** |
 | POST | `/tick` | 推进当前分钟（body 可传 `{"minutes": n}`，默认 1） |
 | GET | `/passages/{edge_id}/load` | 通道逐分钟占用与各分钟有效上限，可加 `?minute=n` |
 | GET | `/revisions` | 列出全部修订（修订号/触发操作/当时分钟），重置与重启后保留 |
@@ -343,6 +353,92 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 * **场景重置**（`POST /scenario`）清空全部清点记录与更正历史；旧修订
   保留，流水号可在新场景重新使用。
 
+**逐段实际通行核报（已出发组沿现行路线核报实际进入/离开分钟）**
+
+* `POST /traversal-reports` 核报一段实际通行：
+
+  ```json
+  {"report_id": "T-0001", "group_id": 1, "seq": 0, "edge_id": 1,
+   "enter_minute": 0, "exit_minute": 4}
+  ```
+
+  * `report_id`：**非空**唯一报送号（幂等键）；`seq` 为现行路线段序号，
+    **从 0 起**；`enter_minute`/`exit_minute` 为实际进入/离开分钟，均须
+    **非负**、进入**早于**离开，且离开**不晚于当前分钟**（非法取值 422）。
+  * 仅**已出发并保留现行路线**的组可核报：`fixed` 可核报全部现行段；
+    `awaiting_rescue`/`rescuing`/`rescued`（待救援、救援中、人工送达）
+    **只核报其已有的通道前缀**；未出发组（`scheduled`/`pending`/`failed`/
+    `blocked`，409 `NOT_DEPARTED`）与不存在的组（422）不可核报。
+  * **沿路线顺序核报**：必须从 `seq=0` 起逐段核报（前序段均已核报），
+    跳段报 409 `OUT_OF_ORDER`；**后段进入不得早于前段实际离开**（409
+    `ENTER_BEFORE_PREVIOUS_EXIT`，两段首尾相接相等允许）。
+  * 现行路线中不存在的段序号报 409 `STEP_NOT_FOUND`（响应给 `max_seq`）；
+    核报通道与现行路线该段通道不符报 409 `EDGE_MISMATCH`
+    （响应给 `expected_edge_id`）。以上拒绝**不留任何记录**。
+  * **同段重复报送**（该序号已有有效核报，即使内容相同但报送号不同）
+    报 409 `DUPLICATE_SEQ`（响应给原报送号与原时刻）；实际离开晚于当前
+    分钟报 409 `EXIT_IN_FUTURE`。
+  * **幂等**：同一报送号**同内容**（组号/序号/通道号/进入/离开均一致）
+    重试返回 HTTP 200 与原记录（即使该记录已因节点滞留改编而失效，也
+    原样返回）；**异内容**返回 409 `TRAVERSAL_REPORT_ID_CONFLICT`
+    （`reason=REPORT_ID_CONTENT_MISMATCH`，附已登记内容），整次拒绝。
+  * 首次受理返回 HTTP 201 与记录（含受理时当前分钟 `reported_minute`）。
+    **核报仅留痕：不反向修改编排、通道占用、容量管制，不产生修订。**
+* **节点滞留改编与实绩前缀**：现场滞留报告改编时，已核报的**已走固定
+  前缀**（`seq < prefix_step_count`）继续有效、仍参与计划/实绩并列与
+  逐分钟汇总；被释放旧余程段上的核报（`seq >= prefix_step_count`）标记
+  为**失效留痕**（`active=false`，附 `detached_minute` 与
+  `detach_reason="delay-replan"`），不再参与并列展示与逐分钟汇总，但
+  仍可在 `detached_reports` 中查询；改编后的**新余程**重新从
+  `seq=prefix_step_count` 起核报（同序号可再次核报）。
+* `GET /traversal-reports/{group_id}` 单组台账（未知组号 404），
+  `GET /traversal-reports` 汇总全部组：
+
+  ```json
+  {
+    "current_minute": 6,
+    "groups": [
+      {"group_id": 1, "status": "fixed", "size": 10,
+       "prefix_step_count": 1,
+       "steps": [
+         {"seq": 0, "edge_id": 1, "from_node": 1, "to_node": 2,
+          "planned_enter_minute": 0, "planned_exit_minute": 4,
+          "actual_enter_minute": 0, "actual_exit_minute": 4,
+          "report_id": "T-0001", "deviates": false, "anomalies": []},
+         {"seq": 1, "edge_id": 2, "from_node": 2, "to_node": 6,
+          "planned_enter_minute": 6, "planned_exit_minute": 8,
+          "actual_enter_minute": null, "actual_exit_minute": null,
+          "report_id": null, "deviates": false, "anomalies": []}],
+       "unreported_seqs": [1], "next_seq": 1,
+       "reports": [{"report_id": "T-0001", "...": "有效核报记录"}],
+       "detached_reports": [{"report_id": "T-0000", "...": "失效留痕"}]}
+    ],
+    "edge_minutes": [
+      {"edge_id": 1, "minute": 3, "used": 15, "effective_capacity": 10,
+       "groups": [{"group_id": 1, "size": 15}],
+       "anomalies": ["OVER_CAPACITY", "CLOSED"]}
+    ]
+  }
+  ```
+
+  * `steps` 并列各段**计划**（`planned_*`）与**实绩**（`actual_*`，
+    未核报为 `null`）时刻；实绩任一时刻与计划不同即 `deviates=true`。
+    `anomalies` 汇总该段实绩区间内出现过的异常：`CLOSED`（实绩区间
+    命中该通道封闭）、`OVER_CAPACITY`（实绩区间某分钟实绩人数超当时
+    有效容量）。
+  * `unreported_seqs`/`next_seq` 给出已出发组尚未核报的现行段序号；
+    未出发组不计未核报（其路线仍可能整体重排）。
+  * `edge_minutes` 按**已核报实绩**（仅有效记录）汇总每个通道每分钟
+    的在场人数（区间 `[enter, exit)` 逐分钟计入组人数）、该分钟
+    **当时有效容量**（容量管制时段内为 `min(原容量, 管制上限)`），
+    并标出异常：`OVER_CAPACITY`（实绩人数超当时有效容量）与 `CLOSED`
+    （该分钟命中通道封闭，仍有实绩通行）。该汇总只看实绩、不含计划
+    占用；逐分钟计划占用仍查 `GET /passages/{edge_id}/load`。
+  * 实绩**偏离计划时刻、命中封闭或超出当时有效容量均照常受理并留痕**，
+    不反向修改编排、占用、封闭/管制或修订。
+* **场景重置**（`POST /scenario`）清空本场全部逐段核报记录（含失效
+  留痕）；旧修订保留，报送号可在新场景重新使用。
+
 ### 响应（GET /plan 与所有变更接口）
 
 ```json
@@ -549,7 +645,7 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 和编排变更在同一 SQLite 事务提交，查询不会看到只写入一方的状态；场景
 重置与服务重启后历史保留、编号继续递增。快照为落库时的完整编排（含当时
 固定组、救援中/已救援组状态与逐段通行时刻），按原样返回，不按当前场景
-重算。救援队登记与**出口清点/清点更正**均不改编排，不产生修订。
+重算。救援队登记、**出口清点/清点更正与逐段实际通行核报**均不改编排，不产生修订。
 
 **GET /revisions**
 
@@ -784,18 +880,37 @@ curl -s http://localhost:8000/exit-counts/1 | python3 -m json.tool
     每次更正追加一条历史并使版本 +1）；版本失配、对同一版本重复更正
     或更正后累计超额均整次拒绝（409），记录与历史不变。清点与更正
     不改编排、不产生修订；场景重置清空全部清点记录与更正历史。
+17. **逐段实际通行核报**：现场对已出发组按现行路线逐段核报实际进入与
+    离开分钟。每次提交非空唯一报送号、组号、现行路线段序号（从 0 起）
+    与通道号；分钟非负、进入早于离开且离开不晚于当前分钟，同组沿路线
+    顺序核报、后段进入不早于前段实际离开。仅已出发并保留路线的组可核
+    报：`fixed` 可核报全部现行段，待救援/救援中/已人工送达组只核报已
+    有通道前缀；未出发组拒绝（409 `NOT_DEPARTED`）。段不存在
+    （`STEP_NOT_FOUND`）、通道不符（`EDGE_MISMATCH`）、越序
+    （`OUT_OF_ORDER`）、同段重复（`DUPLICATE_SEQ`）、后段进入早于前段
+    离开（`ENTER_BEFORE_PREVIOUS_EXIT`）、离开晚于当前分钟
+    （`EXIT_IN_FUTURE`）均整次拒绝且不留记录；同报送号同内容重试返回
+    原记录（HTTP 200，含已失效记录原样返回），同号异内容拒绝（409
+    `TRAVERSAL_REPORT_ID_CONFLICT`）。节点滞留改编时保留已核报固定前缀，
+    把被释放余程段的核报标记失效留痕（仍可在 `detached_reports` 查询、
+    不参与并列与汇总），后续按新余程重新核报同序号。查询并列各段计划
+    与实绩时刻（`deviates` 标偏离）、未核报段，并按已核报实绩汇总通道
+    逐分钟人数，按各分钟当时有效容量（管制时段取 `min(原容量, 管制上限)`）
+    与封闭标 `OVER_CAPACITY`/`CLOSED` 异常。实绩偏离、命中封闭或超额均
+    如实留痕，**不**反向修改编排、通道占用、封闭/管制或修订；受理与时间
+    推进、改编共用同一把互斥锁、保持一致视图；场景重置清空本场全部实绩。
 
 ## 6. 项目结构
 
 ```
 app/
-  main.py       FastAPI 路由、事务/互斥、增量重排（含先导依赖多轮安排）与拒绝逻辑、先导关系登记/查询、现场滞留报告、人工救援队派遣/结案、出口清点登记/更正/查询、修订记录与差异
+  main.py       FastAPI 路由、事务/互斥、增量重排（含先导依赖多轮安排）与拒绝逻辑、先导关系登记/查询、现场滞留报告、人工救援队派遣/结案、出口清点登记/更正/查询、逐段实际通行核报与实绩异常汇总、修订记录与差异
   planner.py    编排核心：时变 FIFO 多标签最短路 + 容量/封闭可行性
   db.py         SQLite 建表、世界状态加载、整组事务化持久化、先导关系/滞留报告/出口清点与修订落库
   schemas.py    Pydantic 输入/输出模型
   seed.py       启动演示数据
 examples/       curl 与 Python 调用示例
-tests/          算法单元测试与 API/并发/修订历史/先导关系/出口清点集成测试（pytest）
+tests/          算法单元测试与 API/并发/修订历史/先导关系/出口清点/逐段通行核报集成测试（pytest）
 ```
 
 本地运行测试：
